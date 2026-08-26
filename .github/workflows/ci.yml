@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Pytest (local pandas fixtures, no Spark/Databricks)
+        run: pytest tests/ -v
+
+      - name: Notebook syntax check (ast.parse — no execution)
+        run: |
+          python - <<'PY'
+          import ast
+          import glob
+          import sys
+
+          failures = []
+          for path in sorted(glob.glob("notebooks/*.py")):
+              try:
+                  ast.parse(open(path, encoding="utf-8").read(), filename=path)
+              except SyntaxError as e:
+                  failures.append(f"{path}: {e}")
+
+          if failures:
+              print("Notebook syntax errors found:")
+              for f in failures:
+                  print(f"  {f}")
+              sys.exit(1)
+          print(f"OK — parsed {len(glob.glob('notebooks/*.py'))} notebook files")
+          PY

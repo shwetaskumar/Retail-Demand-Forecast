@@ -1,0 +1,382 @@
+# databricks.yml — DABs bundle: THREE independent jobs (data / training / inference).
+# Spec: docs/instructions.md §7 (three independent jobs, never bundled), §12 (HPT off the
+# daily critical path), §19 (repo layout). Authoring-only: this file is written to be
+# `databricks bundle deploy`-ready but is NEVER deployed/validated from this environment
+# (no Databricks connectivity here).
+#
+# Targets Databricks Free Edition: serverless-only compute (no classic clusters, no
+# node types, no cluster policies), single-user workspace (no service principal / run_as),
+# single target (no dev/qa/prod split — Free Edition is one workspace). A max of 5
+# concurrent job tasks per account applies on Free Edition, so max_concurrent_runs and
+# task fan-out are kept conservative below. Set your workspace host via
+# `databricks configure --host <your-workspace-url>` (or the DATABRICKS_HOST env var) —
+# never hardcode a workspace URL here.
+#
+# "Each with its own schedule/trigger": each job below has its own independent
+# `schedule:` (cron) — that's what makes the three jobs decoupled/independently
+# runnable per docs/instructions.md §7. Any job can also be run on-demand outside its
+# schedule (ordinary Databricks Jobs behavior) — e.g. to replay a historical snapshot_date.
+
+bundle:
+  name: retail-demand-forecast
+
+variables:
+  market_id:
+    description: >-
+      Market code, e.g. US. Onboarding a new market is a config-table INSERT
+      (config table, via the Databricks App) and re-running these jobs with a
+      different market_id value — never a new target, file, or code change.
+    default: ""
+  snapshot_date:
+    description: >-
+      As-of date for point-in-time run/replay; empty string = current_date()
+      at run time (utils/dates.py::resolve_snapshot_date). Override to
+      replay/backfill any historical date.
+    default: ""
+  train_start_date:
+    description: >-
+      Earliest date_id to include in the training window; empty string =
+      history_start from control.forecast_config (training/run_training.py).
+      Override to e.g. 2023-01-01 for a targeted re-train window.
+    default: ""
+  run_hpt:
+    description: >-
+      "True"/"False" — conditional Optuna HPT for series/cohorts that failed
+      the gate (docs/instructions.md §12: never automatic, explicit remediation
+      only). Surfaced as a dropdown widget in notebooks/02_train.py; the
+      scheduled run leaves this "False" — flip it via "Run now with different
+      parameters" in the Databricks UI, not by editing this file, for a one-off
+      remediation run.
+    default: "False"
+  use_batch_engine:
+    description: >-
+      "True"/"False" — cold-start mode (run_engine_batch: ETS+Ridge per
+      store) instead of the default full rolling-origin CV cascade
+      (run_engine_layered). Surfaced as a dropdown widget in notebooks/02_train.py.
+    default: "False"
+  catalog:
+    description: >-
+      UC catalog for this workspace, passed as --env to every job entrypoint
+      (docs/instructions.md §10 lock: catalog derived from env, never
+      hardcoded). Set below under targets.dev.variables.catalog to whatever
+      catalog your Free Edition workspace uses (its default catalog, or one
+      you've created).
+    default: ""
+  oncall_email:
+    description: "Job-failure notification address. Set your own email below — do not commit a real address to a public template."
+    default: ""
+
+# Library pins mirror requirements.txt. Declared once per environment profile below
+# (resources.jobs.*.environments), referenced by tasks via environment_key — serverless
+# compute has no job_clusters/new_cluster blocks to pin libraries on.
+
+resources:
+  jobs:
+
+    # ===================================================================================
+    # JOB 1: DATA — feature build (notebooks/01_build_features.py). Source tables
+    # READ-ONLY; writes ONLY the new parallel gold.sku_store_features table. Scheduled
+    # daily, ahead of training/inference. Serverless: Spark SQL joins/aggregations only,
+    # no per-series model fitting, no extra ML libraries needed.
+    # ===================================================================================
+    data_job:
+      name: "retail-forecast-data"
+      max_concurrent_runs: 1
+      queue:
+        enabled: true
+      tags:
+        project: retail-demand-forecast
+        job: data
+        market_id: "${var.market_id}"
+        catalog: "${var.catalog}"
+      tasks:
+        - task_key: build_features
+          notebook_task:
+            notebook_path: notebooks/01_build_features.py
+            base_parameters:
+              market_id: "${var.market_id}"
+              env: "${var.catalog}"
+              snapshot_date: "${var.snapshot_date}"
+          timeout_seconds: 7200          # 2h ceiling; TODO: tune once real runtimes are known
+          max_retries: 2
+          min_retry_interval_millis: 300000
+          retry_on_timeout: false
+      schedule:
+        quartz_cron_expression: "0 0 3 * * ?"   # daily 03:00 UTC — TODO confirm cadence
+        timezone_id: "UTC"
+        pause_status: "PAUSED"          # TODO: unpause once validated end-to-end
+      email_notifications:
+        on_failure:
+          - "${var.oncall_email}"
+      timeout_seconds: 7200
+
+    # ===================================================================================
+    # JOB 2: TRAINING — engine/backtest/gate/conditional-HPT. UI-driven: the `train` task
+    # runs notebooks/02_train.py (a notebook_task, dbutils.widgets), not a raw Python
+    # script — the same notebook can be opened and re-run interactively in the workspace
+    # with the widget boxes visible, or triggered here with base_parameters pre-filling
+    # those same widgets. All real logic stays in training/*.py — the notebook only wires
+    # widgets to that call.
+    # Weekly/triggered, NEVER in the daily critical path (docs/instructions.md §12).
+    # ===================================================================================
+    training_job:
+      name: "retail-forecast-training"
+      max_concurrent_runs: 1
+      queue:
+        enabled: true
+      tags:
+        project: retail-demand-forecast
+        job: training
+        market_id: "${var.market_id}"
+        catalog: "${var.catalog}"
+      tasks:
+        - task_key: train
+          environment_key: ml_env
+          notebook_task:
+            notebook_path: notebooks/02_train.py
+            base_parameters:
+              market_id: "${var.market_id}"
+              env: "${var.catalog}"
+              snapshot_date: "${var.snapshot_date}"
+              train_start_date: "${var.train_start_date}"
+              run_hpt: "${var.run_hpt}"
+              use_batch_engine: "${var.use_batch_engine}"
+          timeout_seconds: 21600         # 6h ceiling (weekly job; includes conditional HPT) — TODO: tune
+          max_retries: 1                  # a failed multi-hour training run should not blindly auto-retry
+          min_retry_interval_millis: 600000
+          retry_on_timeout: false
+      environments:
+        - environment_key: ml_env
+          spec:
+            environment_version: "2"
+            dependencies:
+              - prophet==1.1.6
+              - statsforecast==1.7.8
+              - lightgbm==4.5.0
+              - shap==0.46.0
+              - optuna==4.0.0
+              - mlflow==2.17.0
+      schedule:
+        quartz_cron_expression: "0 0 5 ? * MON"   # weekly, Monday 05:00 UTC — TODO confirm cadence
+        timezone_id: "UTC"
+        pause_status: "PAUSED"
+      email_notifications:
+        on_failure:
+          - "${var.oncall_email}"
+      timeout_seconds: 21600
+
+    # ===================================================================================
+    # JOB 1b: BACKFILL — one-time/on-demand historical feature generation
+    # (notebooks/01b_backfill_features.py). Loops over historical snapshot_dates so
+    # gold.sku_store_features has continuous feature coverage from train_start_date to
+    # today. Run once before initial training, and whenever a new market is onboarded or
+    # history needs to be re-seeded. NOT scheduled (on-demand only).
+    # ===================================================================================
+    backfill_job:
+      name: "retail-forecast-backfill"
+      max_concurrent_runs: 1
+      queue:
+        enabled: true
+      tags:
+        project: retail-demand-forecast
+        job: backfill
+        market_id: "${var.market_id}"
+        catalog: "${var.catalog}"
+      tasks:
+        - task_key: backfill_features
+          notebook_task:
+            notebook_path: notebooks/01b_backfill_features.py
+            base_parameters:
+              market_id: "${var.market_id}"
+              env: "${var.catalog}"
+              train_start_date: "${var.train_start_date}"
+              end_date: "${var.snapshot_date}"
+          timeout_seconds: 43200          # 12h ceiling for a full multi-year backfill
+          max_retries: 0                  # backfill is idempotent; re-run manually if needed
+          retry_on_timeout: false
+      email_notifications:
+        on_failure:
+          - "${var.oncall_email}"
+      timeout_seconds: 43200
+      # No schedule — backfill is on-demand only
+
+    # ===================================================================================
+    # JOB 0b: GENERATE SYNTHETIC SOURCE — on-demand, unscheduled. Stands in for a real
+    # POS/ERP source feed on a fresh Free Edition workspace (notebooks/00b_generate_synthetic_source.py).
+    # Not part of the daily/weekly cadence — run once before the first JOB 1 run, or
+    # any time you want to regenerate the demo dataset with a different scale/seed.
+    # ===================================================================================
+    generate_synthetic_source_job:
+      name: "retail-forecast-generate-synthetic-source"
+      max_concurrent_runs: 1
+      queue:
+        enabled: true
+      tags:
+        project: retail-demand-forecast
+        job: generate-synthetic-source
+        market_id: "${var.market_id}"
+        catalog: "${var.catalog}"
+      tasks:
+        - task_key: generate_synthetic_source
+          notebook_task:
+            notebook_path: notebooks/00b_generate_synthetic_source.py
+            base_parameters:
+              env: "${var.catalog}"
+              market_id: "${var.market_id}"
+      email_notifications:
+        on_failure:
+          - "${var.oncall_email}"
+      timeout_seconds: 1800
+      # No schedule — on-demand only
+
+    # ===================================================================================
+    # JOB 3: INFERENCE — 140-day scoring only, no training (notebooks/03_score.py).
+    # Daily, cheap (docs/instructions.md §13). Runs after JOB 1 (needs that day's feature
+    # snapshot) — schedule offset, not a hard dependency link, since the three jobs stay
+    # independently runnable/replayable per §7.
+    #
+    # Extended with the conditional-HPT monitoring chain (evaluate -> hpt_retune ->
+    # infer_final), each depends_on the previous. Both hpt_retune and infer_final
+    # self-gate internally — they query breach_flag / champion_index.version and return
+    # immediately (near-zero cost/time) when there is nothing to do. This keeps
+    # docs/instructions.md §12 ("HPT never in the daily critical path") intact in
+    # substance: score's own budget/timeout is unaffected, and Optuna only ever touches
+    # the narrow set of actually-breached series.
+    #
+    # temp_closure -> outbound close out the chain (post-model transforms limited to
+    # temporary-closure zeroing and the final downstream publish — item/store proxy
+    # backfill and level-adaptation adjustment are not part of this project; see README).
+    # ===================================================================================
+    inference_job:
+      name: "retail-forecast-inference"
+      max_concurrent_runs: 1
+      queue:
+        enabled: true
+      tags:
+        project: retail-demand-forecast
+        job: inference
+        market_id: "${var.market_id}"
+        catalog: "${var.catalog}"
+      tasks:
+        - task_key: score
+          environment_key: ml_env
+          notebook_task:
+            notebook_path: notebooks/03_score.py
+            base_parameters:
+              market_id: "${var.market_id}"
+              env: "${var.catalog}"
+              snapshot_date: "${var.snapshot_date}"
+          timeout_seconds: 5400          # 90min ceiling; TODO: tune once real runtimes are known
+          max_retries: 2
+          min_retry_interval_millis: 300000
+          retry_on_timeout: false
+
+        - task_key: evaluate
+          depends_on:
+            - task_key: score
+          notebook_task:
+            notebook_path: notebooks/04_evaluate.py
+            base_parameters:
+              market_id: "${var.market_id}"
+              env: "${var.catalog}"
+              snapshot_date: "${var.snapshot_date}"
+          timeout_seconds: 1800          # 30min ceiling; single lag-7 WMAPE join + breach check
+          max_retries: 2
+          min_retry_interval_millis: 300000
+          retry_on_timeout: false
+
+        - task_key: hpt_retune
+          environment_key: ml_env
+          depends_on:
+            - task_key: evaluate
+          notebook_task:
+            notebook_path: notebooks/05_hpt_retune.py
+            base_parameters:
+              market_id: "${var.market_id}"
+              env: "${var.catalog}"
+              snapshot_date: "${var.snapshot_date}"
+              train_start_date: "${var.train_start_date}"
+          timeout_seconds: 7200          # 2h ceiling for a genuine breach day; near-instant no-op otherwise
+          max_retries: 1                  # a failed retune run should not blindly auto-retry
+          min_retry_interval_millis: 600000
+          retry_on_timeout: false
+
+        - task_key: infer_final
+          environment_key: ml_env
+          depends_on:
+            - task_key: hpt_retune
+          notebook_task:
+            notebook_path: notebooks/06_infer_final.py
+            base_parameters:
+              market_id: "${var.market_id}"
+              env: "${var.catalog}"
+              snapshot_date: "${var.snapshot_date}"
+          timeout_seconds: 5400
+          max_retries: 2
+          min_retry_interval_millis: 300000
+          retry_on_timeout: false
+
+        - task_key: temp_closure
+          depends_on:
+            - task_key: infer_final
+          notebook_task:
+            notebook_path: notebooks/08_temp_closure.py
+            base_parameters:
+              market_id: "${var.market_id}"
+              env: "${var.catalog}"
+              snapshot_date: "${var.snapshot_date}"
+          timeout_seconds: 1800          # 30min ceiling; typically < 5min (SQL joins + merge)
+          max_retries: 2
+          min_retry_interval_millis: 300000
+          retry_on_timeout: false
+
+        - task_key: outbound
+          depends_on:
+            - task_key: temp_closure
+          notebook_task:
+            notebook_path: notebooks/09_outbound.py
+            base_parameters:
+              market_id: "${var.market_id}"
+              env: "${var.catalog}"
+              snapshot_date: "${var.snapshot_date}"
+          timeout_seconds: 1800
+          max_retries: 2
+          min_retry_interval_millis: 300000
+          retry_on_timeout: false
+
+      environments:
+        - environment_key: ml_env
+          spec:
+            environment_version: "2"
+            dependencies:
+              - prophet==1.1.6
+              - statsforecast==1.7.8
+              - lightgbm==4.5.0
+              - shap==0.46.0
+              - optuna==4.0.0
+              - mlflow==2.17.0
+
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"     # daily 06:00 UTC, after the data job — TODO confirm
+        timezone_id: "UTC"
+        pause_status: "PAUSED"
+      email_notifications:
+        on_failure:
+          - "${var.oncall_email}"
+      timeout_seconds: 14400          # 4h ceiling: score (~90min) + evaluate/hpt_retune/infer_final
+                                       # headroom for a genuine breach day; near-instant no-op tasks
+                                       # on every other day keep the typical run close to score's own time
+
+targets:
+  dev:
+    default: true
+    mode: development
+    workspace:
+      # No host here — configure via `databricks configure --host <your-workspace-url>`
+      # or the DATABRICKS_HOST env var. Free Edition is single-workspace, so there's
+      # nothing to select between.
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      catalog: ""   # TODO: set to your Free Edition workspace's catalog name
+      oncall_email: ""   # TODO: set to your own email
+    # No `run_as` — Free Edition is single-user, jobs run as whoever deploys the bundle.

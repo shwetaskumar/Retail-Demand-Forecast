@@ -1,0 +1,19 @@
+# ruff.toml — lint config.
+#
+# notebooks/ is excluded entirely: those files use Databricks-injected globals
+# (spark, dbutils, display) that don't exist to a static linter, and the
+# `# COMMAND ----------` cell-marker convention means module-level code
+# legitimately runs between imports. Per CLAUDE.md's "Verify" definition,
+# notebooks are checked with `ast.parse` only (syntax), not ruff.
+extend-exclude = ["notebooks"]
+
+line-length = 120
+target-version = "py311"
+
+[lint.per-file-ignores]
+# All three scripts inject the repo root onto sys.path (for standalone `python
+# training/run_fit_*.py` / `python demo/run_local_demo.py` execution) before
+# importing local packages — the late import is intentional.
+"training/run_fit_local.py" = ["E402"]
+"training/run_fit_global.py" = ["E402"]
+"demo/run_local_demo.py" = ["E402"]

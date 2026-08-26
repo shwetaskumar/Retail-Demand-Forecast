@@ -1,0 +1,77 @@
+{
+  "seed": 42,
+  "n_stores": 12,
+  "n_skus": 40,
+  "n_series_sampled": 40,
+  "n_series_evaluated": 40,
+  "candidate_models": [
+    "prophet",
+    "statsforecast",
+    "lgbm",
+    "elastic_net",
+    "croston"
+  ],
+  "overall_wmape_7d": 0.1268054764134444,
+  "category_summary": [
+    {
+      "category": "A",
+      "wmape": 0.08020864090898627,
+      "threshold": 0.85,
+      "passed": true,
+      "volume": 160843.3
+    },
+    {
+      "category": "B",
+      "wmape": 0.1292918820218335,
+      "threshold": 0.75,
+      "passed": true,
+      "volume": 147747.09999999998
+    },
+    {
+      "category": "C",
+      "wmape": 0.10999073271096686,
+      "threshold": 0.65,
+      "passed": true,
+      "volume": 34112.7
+    },
+    {
+      "category": "D",
+      "wmape": 0.34676772985964793,
+      "threshold": 0.6,
+      "passed": true,
+      "volume": 31132.399999999998
+    },
+    {
+      "category": "SEASONAL",
+      "wmape": 0.1463865062998912,
+      "threshold": 0.8,
+      "passed": true,
+      "volume": 43566.3
+    }
+  ],
+  "charts": [
+    {
+      "file": "forecast_0_SKU00028_ST0009.png",
+      "series_key": "US|A|ST0009|SKU00028",
+      "model_type": "croston",
+      "wmape_7d": 0.061658344526535964
+    },
+    {
+      "file": "forecast_1_SKU00028_ST0001.png",
+      "series_key": "US|A|ST0001|SKU00028",
+      "model_type": "elastic_net",
+      "wmape_7d": 0.11347968364077905
+    },
+    {
+      "file": "forecast_2_SKU00025_ST0003.png",
+      "series_key": "US|D|ST0003|SKU00025",
+      "model_type": "lgbm",
+      "wmape_7d": 0.3260692389190037
+    }
+  ],
+  "timing": {
+    "fit_and_select_seconds": 13.23,
+    "total_seconds": 15.21,
+    "series_per_second": 3.022
+  }
+}

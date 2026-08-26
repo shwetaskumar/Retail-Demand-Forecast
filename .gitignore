@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Databricks workspace artifacts
+.databricks/
+.vscode/
+
+# Local AI-assistant tooling / working notes (not user-facing)
+.claude/
+CLAUDE.md
+BUILD_PROMPTS.md
+
+# Local-only utilities
+uv
+
+# OS files
+.DS_Store
+Thumbs.db
