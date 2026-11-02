@@ -2,8 +2,8 @@
 tests/test_halo_cannibalization_features.py — pure-Python unit tests for
 data/features/halo_cannibalization_features.py.
 
-The feature-construction logic itself is Spark SQL (no local Spark session per
-CLAUDE.md — this repo is authoring-only), same as its siblings event_features.py /
+The feature-construction logic itself is Spark SQL (no local Spark session —
+no Spark in the test suite), same as its siblings event_features.py /
 category_features.py, neither of which has Spark-execution tests either. What IS
 testable locally, pure Python, is `classify_relation` — the exact mirror of the SQL
 WHERE-clause thresholds used to label a pair 'halo' / 'cannib' / no relation

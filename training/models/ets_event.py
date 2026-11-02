@@ -153,7 +153,7 @@ class ETSEventModel(ForecastModel):
     """
 
     model_type = "ets_event"
-    evaluation_cost = 1  # batch-capable via statsforecast AutoETS
+    evaluation_cost = 3  # ETS-family tier — runs after lgbm/croston/elastic_net/auto_arima, before prophet
 
     def __init__(self, season_length: int = 7):
         self.season_length    = season_length

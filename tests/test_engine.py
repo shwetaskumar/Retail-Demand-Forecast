@@ -237,3 +237,111 @@ class TestFitOneSeries:
 # run_engine_layered/run_engine_batch/select_champions_spark generally: real Spark
 # integration is verified on Databricks, not via a local fake; only the pure
 # per-series logic (fit_one_series, tested above) is unit-tested locally.
+
+
+class TestVolumeContract:
+    """`volume` is the gate's weighting term at every grain (training/evaluation.py:
+    `grain_wmape = sum(wmape_i * volume_i) / sum(volume_i)`), so BOTH producers of
+    champion_index.volume must define it over the same window.
+
+    They did not until 2026-09-10: training/engine_layered.py:306 used the last
+    backtest fold's holdout |qty| (7 days), while training/engine.py's
+    evaluate_candidate summed the ENTIRE training series (~360 days). Because HPT is
+    conditional, only the retuned subset carried the long-window value — so the mix
+    silently weighted those series ~50x more than the rest in every volume-weighted
+    aggregate, and the WMAPE gate was measuring something no one intended. A uniform
+    scale error would have cancelled out; it was specifically the mixture that bit.
+    """
+
+    def test_evaluate_candidate_volume_is_holdout_window_not_whole_series(self):
+        market_cfg = _market_config(eval_horizon_days=7, backtest_folds=1, val_weeks=2)
+        pdf = _series_pdf(n_days=150)
+        identity = ("US|A|S1|ITEM_A", "US", "A", "S1", "ITEM_A", "2024-06-01")
+
+        row = engine.evaluate_candidate(
+            _FakeForecastModel(), "fake", {}, pdf, market_cfg, identity
+        )
+
+        assert row["status"] == "ok"
+        expected_holdout = float(pdf["qty"].astype(float).abs().tail(7).sum())
+        whole_series = float(pdf["qty"].astype(float).abs().sum())
+        # The two must be far apart for this test to mean anything.
+        assert whole_series > expected_holdout * 10
+        assert row["volume"] == pytest.approx(expected_holdout)
+
+    def test_both_producers_agree_on_the_same_series(self):
+        """engine_layered's per-series volume (last fold's holdout |qty|) and
+        evaluate_candidate's volume must be identical for the same input."""
+        from training.backtest import rolling_origin_folds
+
+        market_cfg = _market_config(eval_horizon_days=7, backtest_folds=1, val_weeks=2)
+        pdf = _series_pdf(n_days=150)
+        identity = ("US|A|S1|ITEM_A", "US", "A", "S1", "ITEM_A", "2024-06-01")
+
+        engine_volume = engine.evaluate_candidate(
+            _FakeForecastModel(), "fake", {}, pdf, market_cfg, identity
+        )["volume"]
+
+        # Mirror of training/engine_layered.py's own computation.
+        folds = rolling_origin_folds(
+            pdf.assign(date_id=pd.to_datetime(pdf["date_id"])),
+            1, market_cfg.val_weeks, market_cfg.eval_horizon_days,
+        )
+        _last_train, last_hold = folds[-1]
+        layered_volume = float(last_hold["qty"].astype(float).abs().sum())
+
+        assert engine_volume == pytest.approx(layered_volume)
+
+
+class _FakeExpensivePerfectModel(_FakeForecastModel):
+    """A costlier tier that is always perfect — only reached if the cheap tier misses the gate."""
+
+    model_type = "fake_expensive"
+    evaluation_cost = 9
+
+
+class TestRelativeGateEarlyStop:
+    """On _series_pdf() the trailing-28-day-mean baseline averages ~31.4% WMAPE across the
+    5 folds, while the cheap fake with bias=1.0 averages ~21.5%: it MISSES the absolute 85%
+    target (needs <=15%) but BEATS the baseline by ~32% — so only the relative gate lets the
+    cascade stop at the cheap tier."""
+
+    @staticmethod
+    def _config(min_skill):
+        models = [
+            ModelConfig(market_id="US", model_type="fake", enabled=True, param_space={"bias": 1.0}),
+            ModelConfig(market_id="US", model_type="fake_expensive", enabled=True, param_space={}),
+        ]
+        config = _forecast_config(models)
+        cat = config.categories[0]
+        return ForecastConfig(
+            market_config=config.market_config,
+            categories=[CategoryConfig(
+                market_id=cat.market_id, category=cat.category, accuracy_threshold=cat.accuracy_threshold,
+                gate_grains=[], series_grain=cat.series_grain, drift_tolerance=cat.drift_tolerance,
+                min_skill_vs_baseline=min_skill,
+            )],
+            models=config.models,
+            features=config.features,
+        )
+
+    @pytest.fixture(autouse=True)
+    def _register(self, monkeypatch):
+        monkeypatch.setitem(engine.STAGE1_MODEL_REGISTRY, "fake_expensive", _FakeExpensivePerfectModel)
+
+    def test_baseline_wmape_is_reported(self):
+        row = fit_one_series(_series_pdf(), self._config(0.20), "2024-06-01").iloc[0]
+        assert row["baseline_wmape_7d"] == pytest.approx((0.4464 * 3 + 0.1163 * 2) / 5, abs=1e-3)
+
+    def test_absolute_gate_escalates_to_expensive_tier(self):
+        row = fit_one_series(_series_pdf(), self._config(None), "2024-06-01").iloc[0]
+        assert row["model_type"] == "fake_expensive"
+
+    def test_relative_gate_stops_at_cheap_tier(self):
+        row = fit_one_series(_series_pdf(), self._config(0.20), "2024-06-01").iloc[0]
+        assert row["model_type"] == "fake"
+
+    def test_relative_gate_escalates_when_skill_too_low(self):
+        row = fit_one_series(_series_pdf(), self._config(0.50), "2024-06-01").iloc[0]
+        assert row["model_type"] == "fake_expensive"
+

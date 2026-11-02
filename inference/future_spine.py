@@ -54,8 +54,12 @@ def build_future_spine(
         cannib_partner_corr_strength, halo_partner_promo_active_flag/count,
         cannib_partner_promo_active_flag/count (data/features/halo_cannibalization_features.py)
 
+      * lag_365: same-date-last-year realised qty. The ONE lag feature that is safe
+        across the whole horizon (365 > horizon_days, so d-365 always predates
+        snapshot_date); training/models/lgbm.py consumes it. See step 6.
+
     NOT included (historical-only — leakage if used on future rows):
-      lag_*, rolling_*, ewma_*, expanding_*, same_weekday_last_year, yoy_ratio,
+      lag_1/7/14/28, rolling_*, ewma_*, expanding_*, same_weekday_last_year, yoy_ratio,
       trailing_zero_sales_ratio, isActive, qty.
 
     Args:
@@ -136,4 +140,37 @@ def build_future_spine(
     # market the table exists but has zero rows, so every halo/cannib column below
     # simply COALESCEs to 0/0.0 rather than failing.
     partner_map_df = read_partner_map(spark, catalog, market_id)
-    return build_known_at_inference_features(spark, catalog, market_id, holiday_df, partner_map_df)
+    halo_df = build_known_at_inference_features(spark, catalog, market_id, holiday_df, partner_map_df)
+
+    # ── 6. lag_365 — the one demand-history feature that is horizon-safe ───────
+    # training/models/lgbm.py trains on lag_365, so the spine MUST carry it: that
+    # wrapper's build_calendar_feature_matrix() fills any absent column with 0, which
+    # would silently train on real year-ago demand and then score against zeros.
+    #
+    # Safe for the entire horizon because 365 > horizon_days: for every horizon date d,
+    # d - 365 is at least (365 - horizon_days) days before snapshot_date, so it is
+    # always realised history and never a value this forecast is trying to predict.
+    # Deliberately NOT generalised to lag_1/7/14/28 or the rolling_* family — those
+    # windows do reach into the horizon and are correctly excluded (see this module's
+    # docstring). COALESCE to 0.0 mirrors build_calendar_feature_matrix's own fillna(0)
+    # so a series with no observation exactly one year back behaves identically in
+    # training and scoring.
+    halo_df.createOrReplaceTempView("_spine_pre_lag365")
+    return spark.sql(f"""
+        WITH hist AS (
+            SELECT store_id, sku_id, date_id, qty,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY store_id, sku_id, date_id
+                       ORDER BY snapshot_date DESC
+                   ) AS rn
+            FROM {catalog}.gold.sku_store_features
+            WHERE market_id = '{safe_market_id}'
+              AND snapshot_date <= DATE('{snap.isoformat()}')
+        )
+        SELECT s.*, COALESCE(h.qty, 0.0) AS lag_365
+        FROM _spine_pre_lag365 s
+        LEFT JOIN (SELECT store_id, sku_id, date_id, qty FROM hist WHERE rn = 1) h
+               ON s.store_id = h.store_id
+              AND s.sku_id   = h.sku_id
+              AND h.date_id  = DATE_SUB(s.date_id, 365)
+    """)

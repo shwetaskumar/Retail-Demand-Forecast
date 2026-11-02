@@ -48,10 +48,23 @@ def merge_upsert(
         → updated on every MERGE action, both INSERT and reprocess UPDATE.
       - `created_ts` is NOT in df.columns (DDL DEFAULT only)
         → set once on first INSERT, never touched on reprocess UPDATE.
+
+    Bootstraps the target table from `df`'s own schema on first write if it
+    doesn't exist yet (e.g. a fresh deploy) rather than requiring a
+    hand-authored CREATE TABLE to already be in place — several of this
+    pipeline's tables (sku_store_features, champion_index, output,
+    decomposition, ...) have no DDL file in this repo; they were always
+    expected to be created this way. The DDL files that DO exist for a table
+    (e.g. data/ddl/migrate_add_halo_cannibalization.sql's halo_cannib_partners,
+    with its CHECK constraint) still take priority when run first — this is
+    only a fallback for tables nothing has created yet.
     """
     from delta.tables import DeltaTable
 
     full_name = f"{catalog}.{schema}.{table}"
+    if not spark.catalog.tableExists(full_name):
+        df.write.format("delta").saveAsTable(full_name)
+        return
     merge_condition = " AND ".join(f"target.{key} <=> source.{key}" for key in merge_keys)
     dt = DeltaTable.forName(spark, full_name)
     merge_builder = dt.alias("target").merge(df.alias("source"), merge_condition)

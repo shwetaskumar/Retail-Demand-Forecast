@@ -95,7 +95,7 @@ class ElasticNetModel(ForecastModel):
     """
 
     model_type = "elastic_net"
-    evaluation_cost = 1   # scikit-learn coordinate descent: ~1ms/series, same tier as ETS
+    evaluation_cost = 3   # merged ETS-family tier (config_model.cost_tier normally overrides this)
 
     def __init__(self) -> None:
         self._alpha: float = _DEFAULT_ALPHA

@@ -26,6 +26,8 @@
 --   features_known      — JSON list of feature names known at inference time
 --   market_settings     — all scalar market settings as one JSON object
 --   category_thresholds — accuracy gates per category as JSON object
+--   category_skill_thresholds — optional relative gate per category as JSON object
+--                     ({category: min_skill_vs_baseline}; see training/evaluation.py)
 --
 -- Parameterize ${catalog}. RUN IN DATABRICKS.
 -- ============================================================================

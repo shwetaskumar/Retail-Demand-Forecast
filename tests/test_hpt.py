@@ -1,7 +1,7 @@
 """
 tests/test_hpt.py — conditional HPT unit tests (Step 8, docs/instructions.md §12).
 
-`needs_tuning` (the "selection" BUILD_PROMPTS.md Step 8 asks to unit-test) is
+`needs_tuning` (the HPT "selection" step) is
 pure pandas. `tune_series` uses the real, already-installed Optuna (no mock —
 proving the search actually converges) against a fake, deterministic
 ForecastModel (same trick as tests/test_backtest.py). `tune_one_series` is

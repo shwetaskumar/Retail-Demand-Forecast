@@ -26,7 +26,7 @@ from datetime import date
 
 dbutils.widgets.text("env", "retail_forecast", "Environment (catalog)")
 dbutils.widgets.text("snapshot_date", "", "Snapshot date (YYYY-MM-DD, blank=today)")
-dbutils.widgets.text("market_id", "US", "Market ID")
+dbutils.widgets.text("market_id", "CA", "Market ID")
 
 # COMMAND ----------
 
@@ -64,14 +64,24 @@ logger.info(f"OUTBOUND: target={_TARGET_TABLE}")
 
 # COMMAND ----------
 
-forecast_horizon = int(
-    spark.sql(f"""
-        SELECT param_value
-        FROM {catalog}.control.forecast_config
-        WHERE upper(market_id) = upper('{safe_market_id}')
-          AND param_name = 'horizon_days'
-    """).collect()[0].param_value
-)
+# forecast_config uses the compact v2 schema (config/seed_defaults.py,
+# config/ddl/config_tables.sql): scalar market settings are packed into ONE
+# JSON blob under param_name='market_settings', not a separate row per
+# setting — there is no standalone 'horizon_days' row to read directly.
+import json as _json
+
+_market_settings_rows = spark.sql(f"""
+    SELECT param_value
+    FROM {catalog}.control.forecast_config
+    WHERE upper(market_id) = upper('{safe_market_id}')
+      AND param_name = 'market_settings'
+""").collect()
+if not _market_settings_rows:
+    raise ValueError(
+        f"No market_settings config row found for market_id={safe_market_id} "
+        f"in {catalog}.control.forecast_config — run config/seed_defaults.py first."
+    )
+forecast_horizon = int(_json.loads(_market_settings_rows[0].param_value)["horizon_days"])
 logger.info(f"OUTBOUND: forecast_horizon={forecast_horizon} days")
 
 # COMMAND ----------

@@ -23,20 +23,11 @@
 # COMMAND ----------
 
 # DBTITLE 1,Widgets
-dbutils.widgets.text("market_id", "US")
+dbutils.widgets.text("market_id", "CA")
 dbutils.widgets.text("env", "retail_forecast")
 dbutils.widgets.text("snapshot_date", "")
 dbutils.widgets.text("filter_sku", "")
 dbutils.widgets.text("filter_store", "")
-
-# COMMAND ----------
-
-# DBTITLE 1,Install pinned deps (interactive runs only)
-# MAGIC %pip install -r ../requirements.txt
-
-# COMMAND ----------
-
-dbutils.library.restartPython()
 
 # COMMAND ----------
 
@@ -57,8 +48,12 @@ filter_store = _parse_filter(dbutils.widgets.get("filter_store"))
 import os
 import sys
 
-_notebook_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
-_REPO_ROOT = "/Workspace" + os.path.dirname(os.path.dirname(_notebook_path))
+# Databricks Free Edition serverless compute can stat/list Workspace Files but
+# cannot open() them for content (Input/output error from
+# SharedUCWorkspaceLocalFileSystem — a Free Edition environment limitation).
+# Shared modules are synced to a UC Volume instead of imported straight from
+# the bundle-deployed Workspace path.
+_REPO_ROOT = f"/Volumes/{env}/default/pylib"
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 

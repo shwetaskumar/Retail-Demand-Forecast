@@ -1,77 +1,130 @@
 {
-  "seed": 42,
-  "n_stores": 12,
-  "n_skus": 40,
-  "n_series_sampled": 40,
-  "n_series_evaluated": 40,
-  "candidate_models": [
-    "prophet",
-    "statsforecast",
-    "lgbm",
-    "elastic_net",
-    "croston"
+  "dataset": "Kaggle M5 Forecasting Accuracy (Walmart)",
+  "states": [
+    "CA"
   ],
-  "overall_wmape_7d": 0.1268054764134444,
-  "category_summary": [
+  "max_skus": 300,
+  "trailing_days": 730,
+  "n_series_sampled": 150,
+  "n_series_evaluated": 150,
+  "candidate_models": [
+    "ensemble"
+  ],
+  "metric": "7-day weekly-total WMAPE, pooled: sum|A-F| / sum A over series",
+  "holdout_overall": {
+    "n_series": 150,
+    "median_weekly_units": 5.0,
+    "champion_wmape": 0.3569145446980944,
+    "baseline_wmape": 0.3659650516282764,
+    "champion_skill": 0.024730522463590088,
+    "noise_floor_wmape": 0.23713509978861053
+  },
+  "holdout_by_category": {
+    "A": {
+      "n_series": 51,
+      "median_weekly_units": 12.0,
+      "champion_wmape": 0.3000280265275924,
+      "baseline_wmape": 0.2939356435643564,
+      "champion_skill": -0.020726928144398693,
+      "noise_floor_wmape": 0.17903018934846668
+    },
+    "B": {
+      "n_series": 31,
+      "median_weekly_units": 6.0,
+      "champion_wmape": 0.429193300297809,
+      "baseline_wmape": 0.4359903381642512,
+      "champion_skill": 0.015589881865413102,
+      "noise_floor_wmape": 0.30293368908661145
+    },
+    "C": {
+      "n_series": 38,
+      "median_weekly_units": 3.0,
+      "champion_wmape": 0.4898301913118732,
+      "baseline_wmape": 0.5184049079754601,
+      "champion_skill": 0.055120459362895446,
+      "noise_floor_wmape": 0.37699267803664116
+    },
+    "SEASONAL": {
+      "n_series": 30,
+      "median_weekly_units": 1.0,
+      "champion_wmape": 0.47219051845832594,
+      "baseline_wmape": 0.5987654320987654,
+      "champion_skill": 0.2113931547397031,
+      "noise_floor_wmape": 0.47802771502693864
+    }
+  },
+  "backtest_gate_by_category": [
     {
+      "market_id": "CA",
       "category": "A",
-      "wmape": 0.08020864090898627,
-      "threshold": 0.85,
-      "passed": true,
-      "volume": 160843.3
+      "wmape": 0.3407743553366992,
+      "baseline_wmape": 0.37395565738226355,
+      "skill": 0.08873057912223503,
+      "min_skill": 0.03,
+      "passed": true
     },
     {
+      "market_id": "CA",
       "category": "B",
-      "wmape": 0.1292918820218335,
-      "threshold": 0.75,
-      "passed": true,
-      "volume": 147747.09999999998
+      "wmape": 0.4689684697098586,
+      "baseline_wmape": 0.5136668996788043,
+      "skill": 0.08701831867479803,
+      "min_skill": 0.03,
+      "passed": true
     },
     {
+      "market_id": "CA",
       "category": "C",
-      "wmape": 0.10999073271096686,
-      "threshold": 0.65,
-      "passed": true,
-      "volume": 34112.7
+      "wmape": 0.4969059293139981,
+      "baseline_wmape": 0.5366326080320646,
+      "skill": 0.07402956533661254,
+      "min_skill": 0.03,
+      "passed": true
     },
     {
-      "category": "D",
-      "wmape": 0.34676772985964793,
-      "threshold": 0.6,
-      "passed": true,
-      "volume": 31132.399999999998
-    },
-    {
+      "market_id": "CA",
       "category": "SEASONAL",
-      "wmape": 0.1463865062998912,
-      "threshold": 0.8,
-      "passed": true,
-      "volume": 43566.3
+      "wmape": 0.48897258082496614,
+      "baseline_wmape": 0.6060364155574436,
+      "skill": 0.19316303728184392,
+      "min_skill": 0.03,
+      "passed": true
     }
   ],
+  "backtest_gate_pass_rate_by_grain": {
+    "category_cohort": 1.0,
+    "market_sku": 0.5491803278688525,
+    "market_store_sku": 0.5850340136054422
+  },
+  "champion_model_counts": {
+    "ensemble": 150
+  },
   "charts": [
     {
-      "file": "forecast_0_SKU00028_ST0009.png",
-      "series_key": "US|A|ST0009|SKU00028",
-      "model_type": "croston",
-      "wmape_7d": 0.061658344526535964
+      "file": "forecast_0_FOODS_3_148_CA_3.png",
+      "series_key": "CA|A|CA_3|FOODS_3_148",
+      "model_type": "ensemble",
+      "holdout_wmape": 0.2588673770716867,
+      "holdout_weekly_units": 32.0
     },
     {
-      "file": "forecast_1_SKU00028_ST0001.png",
-      "series_key": "US|A|ST0001|SKU00028",
-      "model_type": "elastic_net",
-      "wmape_7d": 0.11347968364077905
+      "file": "forecast_1_FOODS_3_157_CA_1.png",
+      "series_key": "CA|B|CA_1|FOODS_3_157",
+      "model_type": "ensemble",
+      "holdout_wmape": 0.26321508641355323,
+      "holdout_weekly_units": 15.0
     },
     {
-      "file": "forecast_2_SKU00025_ST0003.png",
-      "series_key": "US|D|ST0003|SKU00025",
-      "model_type": "lgbm",
-      "wmape_7d": 0.3260692389190037
+      "file": "forecast_2_HOUSEHOLD_1_001_CA_2.png",
+      "series_key": "CA|C|CA_2|HOUSEHOLD_1_001",
+      "model_type": "ensemble",
+      "holdout_wmape": 0.2666068969362494,
+      "holdout_weekly_units": 9.0
     }
   ],
   "timing": {
-    "fit_and_select_seconds": 13.23,
-    "total_seconds": 15.21,
-    "series_per_second": 3.022
+    "fit_and_select_seconds": 544.62,
+    "total_seconds": 553.74,
+    "series_per_second": 0.275
   }
 }

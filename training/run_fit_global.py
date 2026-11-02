@@ -64,7 +64,7 @@ def main(market_id: str, env: str, snapshot_date: str | None = None, train_start
     # Fit global per-SKU LightGBM
     global_candidates_df = run_global_lgbm(spark, training_features_df, market_id, as_of_str,
                                             horizon=config.market_config.eval_horizon_days)
-    global_candidates_df.cache()
+    global_candidates_df = global_candidates_df.localCheckpoint()  # .cache() unsupported on Free Edition serverless
     total_global = global_candidates_df.count()
     logger.info(f"FIT_GLOBAL: {total_global} global candidate rows produced")
 

@@ -9,7 +9,7 @@
 Build `${catalog}.gold.sku_store_features` at grain `store_id (store) × sku_id (sku) × date_id`. Target = `qty`. Daily, incremental writes.
 
 ## Parameters
-Read from the **config Delta table** (filtered by `market_id`), not YAML: `market_id` (e.g. 'US'); `snapshot_date` (as-of date; default `current_date()`, overridable to any historical date); `history_start`; `incremental_read_days` (≥400 so t-365 lags & YoY compute); `incremental_write_days` (write last 365). All source reads and lifecycle windows are anchored on `snapshot_date`, never `current_date()` directly.
+Read from the **config Delta table** (filtered by `market_id`), not YAML: `market_id` (e.g. 'CA' — Kaggle M5's state_id); `snapshot_date` (as-of date; default `current_date()`, overridable to any historical date); `history_start`; `incremental_read_days` (≥400 so t-365 lags & YoY compute); `incremental_write_days` (write last 365). All source reads and lifecycle windows are anchored on `snapshot_date`, never `current_date()` directly.
 
 ## Source tables
 SALES `source.sales`; SKU_STORE `source.sku_store`; SKU `source.sku`; STORE `source.store`; EVENTS `gold.events`; DATE `gold.calendar_date`.

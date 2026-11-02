@@ -1,6 +1,6 @@
 # overrides/ — PHASE 2, deferred (placeholder only)
 
-Per `docs/instructions.md` §15 and CLAUDE.md lock #11: the planner-override
+Per `docs/instructions.md` §15: the planner-override
 feedback loop is **deferred to phase 2**. No ingest/feedback code is built
 now. The `overrides` and `config_override_source` table contracts
 already exist (`data/ddl/tables.sql`, `config/ddl/config_tables.sql`)

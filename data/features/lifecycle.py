@@ -5,22 +5,23 @@ data/features/lifecycle.py — Steps 2-4: window_active, lifecycle flags, isActi
 Step 2: window_active = 1 for every row in the dense spine built from sku_store
         [active_from, active_to] ranges — by construction every spine row is within a listing window.
 
-Step 3: is_new_store = 1 if the store has been selling for < 365 days as of the date of
-        processing (CURRENT_DATE()). Uses DATEDIFF(CURRENT_DATE(), MIN(date_id)) < 365
-        so the flag reflects the store's maturity at run-time, not at the historical
-        snapshot_date — critical for backfill correctness (avoids incorrectly flagging
-        now-mature stores as new when reprocessing old snapshots).
+Step 3: is_new_store = 1 if the store has been selling for < 365 days as of `as_of`
+        (the snapshot_date being built — see architecture lock #4: "Features/backtest/
+        scoring are point-in-time as of snapshot_date"). Uses DATEDIFF(as_of, MIN(date_id))
+        < 365. An earlier version of this module used CURRENT_DATE() instead, reasoning
+        that a now-mature store shouldn't be flagged new when reprocessing an old
+        snapshot — but that makes isActive depend on *when the job happens to run*
+        rather than purely on snapshot_date, breaking point-in-time reproducibility
+        (confirmed empirically: on a historical-only data source like Kaggle M5, whose
+        most recent date is years before any real run of this code, CURRENT_DATE()-based
+        lifecycle queries see zero qualifying rows and flag every series "new" forever).
         is_new_item  = 1 if the item has fewer than 365 distinct positive-sales days in
-        the trailing 400-day window from CURRENT_DATE(). Queries sales directly (not via
+        the trailing 400-day window ending at `as_of`. Queries sales directly (not via
         sales_base_df) so the flag is independent of the feature-build window.
         Both are computed from actual sales transactions, NOT from sku_store listing
         dates.
 
 Step 4: isActive = 1 ONLY IF window_active=1 AND is_new_store=0 AND is_new_item=0 AND is_delisted=0.
-
-snapshot_date has NO role in isActive. It controls the read window (read_end = snapshot_date)
-upstream. Whether an item was active on date_id is a historical fact determined solely by
-active_from <= date_id <= active_to in sku_store.
 
 compute_series_eligibility is kept at the bottom for the INFERENCE job (which series are
 currently worth scoring). It is NOT part of the isActive pipeline.
@@ -37,15 +38,18 @@ if TYPE_CHECKING:
 # ── Step 3 helpers ────────────────────────────────────────────────────────────
 
 
-def compute_store_lifecycle(spark: "SparkSession", sales_base_df: "DataFrame") -> "DataFrame":
+def compute_store_lifecycle(
+    spark: "SparkSession", sales_base_df: "DataFrame", as_of: dt.date
+) -> "DataFrame":
     """Return (store_id, is_new_store) from actual sales history.
 
     Spec Step 3: is_new_store = 1 if the store has been selling for < 365 days as of
-    CURRENT_DATE() (the date of processing). Uses DATEDIFF from the store's first sale
-    date so the flag is stable regardless of which snapshot_date the backfill is
-    building — a store that is mature TODAY is never flagged new in any historical
-    snapshot. Computed from real sales transactions only — zero-filled rows must NOT be
-    included, which is why this runs on the raw sales_base_df before gap_fill.
+    `as_of` (the snapshot_date being built). Uses DATEDIFF from the store's first sale
+    date, so the flag is a pure function of (sales history, as_of) — replaying the same
+    snapshot_date always produces the same flag, regardless of when the job actually
+    runs (architecture lock #4: point-in-time as of snapshot_date). Computed from real
+    sales transactions only — zero-filled rows must NOT be included, which is why this
+    runs on the raw sales_base_df before gap_fill.
 
     Within a windowed sales_base_df this is still correct:
       - Store opened WITHIN the window: MIN(date_id) = true first sale → DATEDIFF accurate.
@@ -53,9 +57,9 @@ def compute_store_lifecycle(spark: "SparkSession", sales_base_df: "DataFrame") -
         size (750+ days) > 365 → correctly NOT new.
     """
     sales_base_df.createOrReplaceTempView("_store_lifecycle_input")
-    return spark.sql("""
+    return spark.sql(f"""
         SELECT store_id,
-               CASE WHEN DATEDIFF(CURRENT_DATE(), MIN(date_id)) < 365 THEN 1 ELSE 0 END AS is_new_store
+               CASE WHEN DATEDIFF(DATE('{as_of.isoformat()}'), MIN(date_id)) < 365 THEN 1 ELSE 0 END AS is_new_store
         FROM _store_lifecycle_input
         GROUP BY store_id
     """)
@@ -65,16 +69,17 @@ def compute_item_lifecycle(
     spark: "SparkSession",
     catalog: str,
     market_id: str,
+    as_of: dt.date,
     lookback_days: int = 400,
 ) -> "DataFrame":
     """Return (sku_id, is_new_item) from actual sales history at market level.
 
     Spec Step 3: is_new_item = 1 if the item has fewer than 365 distinct days of
-    positive sales within the trailing lookback_days (default 400) from CURRENT_DATE()
-    (the date of processing). Queries sales directly so the flag always reflects the
-    item's sales density as of run-time — critical for backfill correctness where
-    sales_base_df is scoped to a historical window that may not contain the current
-    trailing period.
+    positive sales within the trailing lookback_days (default 400) ending at `as_of`
+    (the snapshot_date being built — see compute_store_lifecycle's docstring for why
+    this is as_of, not CURRENT_DATE()). Queries sales directly so the flag always
+    reflects the item's sales density as of the snapshot, independent of
+    sales_base_df's own (possibly narrower) read window.
 
     Grouped by sku_id only (market-level) and broadcast to every (store_id, sku_id)
     row for that item in compute_is_active.
@@ -85,7 +90,8 @@ def compute_item_lifecycle(
                CASE WHEN COUNT(DISTINCT CAST(date_id AS DATE)) < 365 THEN 1 ELSE 0 END AS is_new_item
         FROM {catalog}.source.sales
         WHERE UPPER(market_id) = '{safe_market_id}'
-          AND date_id >= DATE_SUB(CURRENT_DATE(), {lookback_days})
+          AND date_id >= DATE_SUB(DATE('{as_of.isoformat()}'), {lookback_days})
+          AND date_id <= DATE('{as_of.isoformat()}')
         GROUP BY UPPER(sku_id)
     """)
 

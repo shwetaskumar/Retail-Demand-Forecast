@@ -15,6 +15,7 @@ import pytest
 
 from training.decomposition.decomposer import validate_decomposition
 from training.models.elastic_net import ElasticNetModel
+from training.models.ensemble import EnsembleModel
 from training.models.lgbm import LightGBMModel
 from training.models.prophet import ProphetModel
 from training.models.statsforecast import StatsForecastModel
@@ -379,3 +380,45 @@ class TestValidateDecompositionOnRealWrappers:
         model = model_factory().fit(train, horizon, params=params)
         decomp = model.decompose(horizon)
         assert validate_decomposition(decomp, reconstruction_tol_pct=0.02) is True
+
+
+class TestEnsembleModel:
+    _MEMBERS = {"member_types": ["elastic_net", "lgbm"], "member_params": {"lgbm": {"n_estimators": 50}}}
+
+    def test_fits_and_reconstructs(self, train_horizon):
+        train, horizon = train_horizon
+        decomp = EnsembleModel().fit(train, horizon, self._MEMBERS).decompose(horizon)
+        _assert_reconstructs(decomp)
+        assert validate_decomposition(decomp, 0.02)
+
+    def test_forecast_is_mean_of_members(self, train_horizon):
+        train, horizon = train_horizon
+        ens = EnsembleModel().fit(train, horizon, self._MEMBERS)
+        en = ElasticNetModel().fit(train, horizon, {})
+        lg = LightGBMModel().fit(train, horizon, {"n_estimators": 50})
+        expected = (en.predict(horizon).to_numpy() + lg.predict(horizon).to_numpy()) / 2
+        np.testing.assert_allclose(ens.predict(horizon).to_numpy(), expected, rtol=1e-9)
+
+    def test_failing_member_is_dropped(self, train_horizon):
+        train, horizon = train_horizon
+        params = {"member_types": ["elastic_net", "not_a_model"]}
+        ens = EnsembleModel().fit(train, horizon, params)
+        np.testing.assert_allclose(
+            ens.predict(horizon).to_numpy(),
+            ElasticNetModel().fit(train, horizon, {}).predict(horizon).to_numpy(),
+        )
+
+    def test_all_members_failing_raises(self, train_horizon):
+        train, horizon = train_horizon
+        with pytest.raises(RuntimeError):
+            EnsembleModel().fit(train, horizon, {"member_types": ["not_a_model"]})
+
+    def test_storable_params_round_trip_through_refit(self, train_horizon):
+        """inference/batch_infer.py's refit fallback passes the stored blob straight back into fit()."""
+        train, horizon = train_horizon
+        ens = EnsembleModel().fit(train, horizon, self._MEMBERS)
+        stored = ens.get_storable_params(self._MEMBERS)
+        assert stored["baseline_params"]["member_types"] == ["elastic_net", "lgbm"]
+        refit = EnsembleModel().fit(train, horizon, stored)
+        np.testing.assert_allclose(refit.predict(horizon).to_numpy(), ens.predict(horizon).to_numpy(), rtol=1e-6)
+

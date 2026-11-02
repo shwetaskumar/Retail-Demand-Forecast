@@ -13,8 +13,10 @@
 # MAGIC This task always runs; `05_hpt_retune` (next in the chain) self-gates on
 # MAGIC whatever this one finds.
 # MAGIC
-# MAGIC WMAPE thresholds are read from `config` via `load_config()` (CategoryConfig.
-# MAGIC accuracy_threshold). The `wmape_threshold` widget is kept as a fallback for
+# MAGIC WMAPE thresholds are read from `config` via `load_config()`: for categories with
+# MAGIC `min_skill_vs_baseline` set (relative gate), a series' threshold is the trailing-28-day-mean
+# MAGIC baseline's WMAPE over the same window × (1 − min_skill); otherwise CategoryConfig.
+# MAGIC accuracy_threshold. The `wmape_threshold` widget is kept as a fallback for
 # MAGIC categories not returned by load_config (e.g. new markets with incomplete config).
 # MAGIC
 # MAGIC Inputs: `output` (lag-7 snapshot) + `source.sales` (actuals).
@@ -24,7 +26,7 @@
 # COMMAND ----------
 
 # DBTITLE 1,Widgets
-dbutils.widgets.text("market_id", "US")
+dbutils.widgets.text("market_id", "CA")
 dbutils.widgets.text("env", "")
 dbutils.widgets.text("snapshot_date", "")
 dbutils.widgets.text("wmape_threshold", "0.5")
@@ -37,15 +39,6 @@ dbutils.widgets.text("filter_category", "")
 # COMMAND ----------
 
 display(dbutils.widgets.getAll())
-
-# COMMAND ----------
-
-# DBTITLE 1,Install pinned deps (interactive runs only — job clusters already have these)
-# MAGIC %pip install -r ../requirements.txt
-
-# COMMAND ----------
-
-dbutils.library.restartPython()
 
 # COMMAND ----------
 
@@ -71,14 +64,13 @@ _scoped_run     = bool(filter_sku or filter_store or filter_category)
 import os
 import sys
 
-# Ask the runtime for THIS notebook's own workspace path, then go up one level
-# (out of notebooks/) to the repo root. Portable across workspaces/usernames and
-# regardless of whether this is deployed via `databricks bundle deploy` or linked
-# as a Databricks Git folder (Repos) backed by Azure DevOps/GitHub — no hardcoded
-# path. __file__ is not available inside a notebook cell, which is why this asks
-# the runtime instead.
-_notebook_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
-_REPO_ROOT = "/Workspace" + os.path.dirname(os.path.dirname(_notebook_path))
+# Databricks Free Edition serverless compute can stat/list Workspace Files but
+# cannot open() them for content (java.io.FileNotFoundException wrapped as
+# "Input/output error" from SharedUCWorkspaceLocalFileSystem — a Free Edition
+# environment limitation, confirmed empirically, not specific to this repo).
+# Shared modules are synced to a UC Volume instead of imported straight from
+# the bundle-deployed Workspace path.
+_REPO_ROOT = f"/Volumes/{env}/default/pylib"
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
@@ -153,7 +145,7 @@ fcst_df = spark.sql(f"""
       AND date_id BETWEEN DATE('{lag_date_str}') AND DATE('{eval_date_str}')
 """)
 
-_no_forecasts = fcst_df.rdd.isEmpty()
+_no_forecasts = fcst_df.isEmpty()  # DataFrame.isEmpty() (Spark 3.3+) — .rdd.isEmpty() is RDD API, unsupported on Spark Connect
 if _no_forecasts:
     logger.warning(
         f"EVALUATE no forecasts found for snapshot_date={lag_date_str}; "
@@ -188,13 +180,33 @@ if not _no_forecasts:
         "market_id":          c.market_id,
         "category":           c.category,
         "effective_threshold": round(1.0 - c.accuracy_threshold, 6),
+        "min_skill":          c.min_skill_vs_baseline,
         "drift_tolerance":    c.drift_tolerance,
-    } for c in _cats])
+    } for c in _cats], schema="market_id string, category string, effective_threshold double, min_skill double, drift_tolerance double")
+    # Relative-gate categories (min_skill set) are judged against the trailing-28-day-mean
+    # baseline over this SAME window and error formula — the live analogue of
+    # training/backtest.py::baseline_wmape. Level = mean daily qty over the 28 days up to
+    # and including the forecast's snapshot_date (point-in-time: nothing after lag_date).
+    from training.backtest import BASELINE_WINDOW_DAYS as _BASELINE_DAYS
+    _base_start_str = (lag_date - datetime.timedelta(days=_BASELINE_DAYS - 1)).isoformat()
+    baseline_level_df = spark.sql(f"""
+        SELECT store_id, sku_id,
+               SUM(units_sold + units_promotional + units_shrinkage) / {_BASELINE_DAYS} AS baseline_level
+        FROM {catalog}.source.sales
+        WHERE market_id = '{safe_market_id}'
+          AND date_id BETWEEN DATE('{_base_start_str}') AND DATE('{lag_date_str}')
+        GROUP BY store_id, sku_id
+    """)
     # Join forecasts with actuals per day across the 7-day horizon
     daily_df = (
         fcst_df.join(actuals_df, on=["store_id", "sku_id", "date_id"], how="left")
         .withColumn("actual_qty", F.coalesce(F.col("actual_qty"), F.lit(0.0)))
         .withColumn("abs_error", F.abs(F.col("forecast_qty") - F.col("actual_qty")))
+        .join(baseline_level_df, on=["store_id", "sku_id"], how="left")
+        .withColumn(
+            "baseline_abs_error",
+            F.abs(F.coalesce(F.col("baseline_level"), F.lit(0.0)) - F.col("actual_qty")),
+        )
     )
     # WMAPE = sum(|error|) / sum(|actual|) aggregated over the full horizon per series
     joined_df = (
@@ -203,17 +215,21 @@ if not _no_forecasts:
                  "store_id", "sku_id")
         .agg(
             (F.sum("abs_error") / F.greatest(F.sum("actual_qty"), F.lit(1.0))).alias("wmape"),
+            (F.sum("baseline_abs_error") / F.greatest(F.sum("actual_qty"), F.lit(1.0))).alias("baseline_wmape"),
         )
         .join(config_df, on=["market_id", "category"], how="left")
         .withColumn(
             "effective_threshold",
-            F.coalesce(F.col("effective_threshold"), F.lit(wmape_threshold))
+            F.when(
+                F.col("min_skill").isNotNull() & (F.col("baseline_wmape") > 0),
+                F.col("baseline_wmape") * (F.lit(1.0) - F.col("min_skill")),
+            ).otherwise(F.coalesce(F.col("effective_threshold"), F.lit(wmape_threshold)))
         )
         .withColumn(
             "above_threshold",
             F.col("wmape") > F.col("effective_threshold") * (F.lit(1.0) + F.coalesce(F.col("drift_tolerance"), F.lit(0.0)))
         )
-        .drop("drift_tolerance")
+        .drop("drift_tolerance", "min_skill")
     )
 
 # COMMAND ----------
@@ -223,6 +239,7 @@ if not _no_forecasts:
     merge_upsert(
         spark, joined_df, catalog, "gold", "eval_daily",
         merge_keys=["eval_date", "series_key"],
+        merge_schema=True,  # baseline_wmape (relative gate) is additive on pre-existing tables
     )
     n_evals = joined_df.count()
     n_above = joined_df.filter(F.col("above_threshold")).count()

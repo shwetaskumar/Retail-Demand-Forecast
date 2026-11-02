@@ -16,7 +16,7 @@
 # COMMAND ----------
 
 # DBTITLE 1,Widgets
-dbutils.widgets.text("market_id", "US")
+dbutils.widgets.text("market_id", "CA")
 dbutils.widgets.text("env", "")
 dbutils.widgets.text("snapshot_date", "")
 dbutils.widgets.text("train_start_date", "")
@@ -38,12 +38,17 @@ display(dbutils.widgets.getAll())
 
 # COMMAND ----------
 
-# DBTITLE 1,Install pinned deps (interactive runs only — job clusters already have these)
-# MAGIC %pip install -r ../requirements.txt
-
-# COMMAND ----------
-
-dbutils.library.restartPython()
+# DBTITLE 1,Dependencies
+# Job-triggered runs get prophet/statsforecast/lightgbm/etc. from the job
+# definition's environment_key: ml_env (see databricks.yml) — no install needed
+# here. A previous version of this cell tried to detect interactive-vs-job via
+# dbutils.notebook...getContext().tags(), but that API is not whitelisted on
+# Databricks Free Edition serverless (Py4JSecurityException), so the guard
+# always evaluated as "not a job" and attempted a pip install against a
+# Workspace-relative path — which itself fails on Free Edition (Workspace
+# Files can't be open()'d for content — see the sys.path note below) and was
+# destabilizing the kernel for the next command. For interactive use, install
+# requirements.txt manually from the workspace's own Volume-synced copy.
 
 # COMMAND ----------
 
@@ -56,19 +61,29 @@ train_start_date = dbutils.widgets.get("train_start_date") or None
 # COMMAND ----------
 
 # DBTITLE 1,sys.path — repo root importable
+import importlib
 import os
+import shutil
 import sys
 
-# Ask the runtime for THIS notebook's own workspace path, then go up one level
-# (out of notebooks/) to the repo root. Portable across workspaces/usernames and
-# regardless of whether this is deployed via `databricks bundle deploy` or linked
-# as a Databricks Git folder (Repos) backed by Azure DevOps/GitHub — no hardcoded
-# path. __file__ is not available inside a notebook cell, which is why this asks
-# the runtime instead.
-_notebook_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
-_REPO_ROOT = "/Workspace" + os.path.dirname(os.path.dirname(_notebook_path))
+# Databricks Free Edition serverless compute can stat/list Workspace Files but
+# cannot open() them for content (java.io.FileNotFoundException wrapped as
+# "Input/output error" from SharedUCWorkspaceLocalFileSystem — a Free Edition
+# environment limitation, confirmed empirically, not specific to this repo).
+# Shared modules are synced to a UC Volume as the source of truth, but importing
+# directly off the Volume triggers Databricks' per-import autoreload-discoverability
+# hook once per module — each one a network round-trip against Volume-backed
+# storage, enough to blow the platform's 80s cell-setup budget once import
+# count grows. One bulk copy to local ephemeral disk avoids the per-import
+# overhead entirely.
+_VOLUME_ROOT = f"/Volumes/{env}/default/pylib"
+_REPO_ROOT = "/tmp/retail_forecast_pylib"
+if os.path.isdir(_REPO_ROOT):
+    shutil.rmtree(_REPO_ROOT)
+shutil.copytree(_VOLUME_ROOT, _REPO_ROOT)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+importlib.invalidate_caches()
 
 # COMMAND ----------
 
@@ -87,6 +102,26 @@ from training.hpt import run_conditional_hpt, select_improved_retunes
 # DBTITLE 1,Spark session, config
 catalog     = env
 spark       = get_or_create_spark(f"job2-hpt-{market_id}")
+
+# sys.path only affects the DRIVER's own Python process — Spark executors run
+# in separate processes/containers that never see it (confirmed empirically:
+# an applyInPandas UDF referencing training.* raised ModuleNotFoundError until
+# this fix). Zip the local copy and ship it to every executor via Spark
+# Connect's artifact API — the serverless-native equivalent of sc.addPyFile().
+import zipfile
+_PYLIB_ZIP = "/tmp/retail_forecast_pylib.zip"
+if os.path.exists(_PYLIB_ZIP):
+    os.remove(_PYLIB_ZIP)
+with zipfile.ZipFile(_PYLIB_ZIP, "w", zipfile.ZIP_DEFLATED) as _zf:
+    for _root, _dirs, _files in os.walk(_REPO_ROOT):
+        _dirs[:] = [d for d in _dirs if d != "__pycache__"]
+        for _f in _files:
+            if _f.endswith(".pyc"):
+                continue
+            _full = os.path.join(_root, _f)
+            _zf.write(_full, os.path.relpath(_full, _REPO_ROOT))
+spark.addArtifacts(_PYLIB_ZIP, pyfile=True)
+
 logger      = get_logger(__name__, market_id=market_id, env=env)
 as_of       = resolve_snapshot_date(snapshot_date)
 as_of_str   = as_of.isoformat()

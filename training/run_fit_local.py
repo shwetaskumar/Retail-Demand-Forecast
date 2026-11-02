@@ -66,7 +66,7 @@ def main(market_id: str, env: str, snapshot_date: str | None = None, train_start
 
     # Batch engine: ~666 location tasks × ~160 series each
     candidate_df = run_engine_batch(spark, training_features_df, config, as_of_str)
-    candidate_df.cache()
+    candidate_df = candidate_df.localCheckpoint()  # .cache() unsupported on Free Edition serverless
     total = candidate_df.count()
     logger.info(f"FIT_LOCAL batch complete: {total} candidate rows")
     for row in candidate_df.groupBy("status").count().collect():

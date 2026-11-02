@@ -65,7 +65,7 @@ _FEATURE_BUCKETS: dict[str, str] = {
     # KNOWN_AT_INFERENCE columns from data/features/halo_cannibalization_features.py.
     # KNOWN_AT_INFERENCE, not hardcoded-imported here (models/*.py reference feature
     # column names as literals, matching training/models/elastic_net.py's convention,
-    # since JOB 1 data/ and JOB 2 training/ stay independent per CLAUDE.md). Promos are
+    # since JOB 1 data/ and JOB 2 training/ stay independent). Promos are
     # known 2mo-1yr ahead, so halo_partner_promo_*/cannib_partner_promo_* are exactly as
     # future-safe as promo_active_flag above; the corr_strength pair is a structural,
     # snapshot-time-fixed attribute, safe for the whole horizon like category.
@@ -80,8 +80,48 @@ _FEATURE_BUCKETS: dict[str, str] = {
     "halo_partner_promo_count":         "cross_sku_lift",
     "cannib_partner_promo_active_flag": "cross_sku_lift",
     "cannib_partner_promo_count":       "cross_sku_lift",
+    # Same-date-last-year demand (added 2026-09-12). Until now this wrapper trained on
+    # calendar/event flags ONLY — it had no signal whatsoever about the series' own
+    # demand history, despite data/features/stat_features.py already materialising a
+    # full lag/rolling set. Those columns are all HISTORICAL_ONLY, so they can't be
+    # used here: lag_1/7/14/28 and every rolling_* window reach into the forecast
+    # horizon itself (lag_7 on horizon day 50 needs day 43's realised qty, which does
+    # not exist), and this engine produces a direct 140-day forecast, not a recursive
+    # one-step-ahead loop.
+    #
+    # lag_365 is the exception, and it is safe for the WHOLE horizon by construction:
+    # for any horizon day h <= 140, (snapshot + h) - 365 is always at least 225 days
+    # BEFORE snapshot_date, i.e. always realised history. inference/future_spine.py
+    # joins it for the horizon with exactly this definition, so train and serve agree
+    # — which matters, because build_calendar_feature_matrix() silently fills a missing
+    # column with 0 and would otherwise train on real values and predict on zeros.
+    # Bucketed to seasonality_yearly: year-ago demand is precisely a yearly-seasonal
+    # signal, and SHAP reconstruction stays exact regardless of bucket assignment.
+    #
+    # NOT added: yoy_ratio (lag_1/lag_365) — it is only 36.7% non-null on this dataset
+    # (lag_365 is frequently 0 in sparse demand) and it depends on lag_1, so it is not
+    # horizon-safe even though it sits in the same feature table.
+    "lag_365": "seasonality_yearly",
 }
 CALENDAR_FEATURE_COLUMNS = [c for c in _FEATURE_BUCKETS if c != "time_idx"]
+
+# Baseline hyperparameters, applied underneath whatever `params` the caller passes (HPT
+# trials / config_model / stored champion params always win). LightGBM's library
+# defaults (31 leaves, 100 trees, min_child_samples=20) overfit a single series' few
+# hundred noisy daily rows: on two disjoint 150-series Kaggle M5 samples (CA, 3-fold
+# rolling backtest) these shallow, regularised trees cut pooled 7-day WMAPE from
+# 43.4% -> 39.9% and 41.2% -> 37.6%. Objective stays plain L2 on purpose: tweedie/poisson
+# scored similarly but fit in log space, so SHAP values would sum to log(yhat) rather
+# than yhat and break the additive decomposition contract (docs/instructions.md §10.1).
+_DEFAULT_LGB_PARAMS: dict = {
+    "num_leaves": 4,
+    "min_child_samples": 60,
+    "n_estimators": 200,
+    "learning_rate": 0.03,
+    "reg_lambda": 5.0,
+    "subsample": 0.8,
+    "subsample_freq": 1,
+}
 
 
 def build_calendar_feature_matrix(pdf: pd.DataFrame, start_idx: int, columns: list[str]) -> pd.DataFrame:
@@ -101,7 +141,7 @@ class LightGBMModel(ForecastModel):
     """LightGBM on calendar+event features; decomposition via grouped SHAP attribution."""
 
     model_type = "lgbm"
-    evaluation_cost = 2  # per-series fit; much cheaper than Prophet but not batch vectorised
+    evaluation_cost = 0  # evaluated first in the cascade (training/engine_layered.py)
 
     def __init__(self) -> None:
         self._model = None           # lgb.LGBMRegressor — set after fit()
@@ -145,7 +185,7 @@ class LightGBMModel(ForecastModel):
         # LightGBM defaults to all cores per fit, so N concurrent tasks each spawn
         # N OpenMP threads → quadratic oversubscription and severe slowdown. Force
         # single-threaded fits; the caller can still override via params.
-        lgb_params = {"n_jobs": 1, **lgb_params}
+        lgb_params = {"n_jobs": 1, **_DEFAULT_LGB_PARAMS, **lgb_params}
         model = lgb.LGBMRegressor(verbosity=-1, **lgb_params)
         model.fit(X, y, sample_weight=sample_weight)
         self._model = model

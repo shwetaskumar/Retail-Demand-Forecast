@@ -100,6 +100,14 @@ def write_features(
         WHERE date_id BETWEEN DATE('{write_start.isoformat()}') AND DATE('{write_end.isoformat()}')
     """)
 
+    # Bootstrap: no DDL file creates sku_store_features in this repo (it was
+    # always expected to already exist — see utils/io.py::merge_upsert's same
+    # note). On a fresh deploy, create it from stamped_df's own schema instead
+    # of requiring spark.table(full_table) below to already resolve.
+    if not spark.catalog.tableExists(full_table):
+        stamped_df.write.format("delta").saveAsTable(full_table)
+        return
+
     # Cast DataFrame columns to match the target table's schema where possible.
     # Columns that exist in BOTH source and target are cast to the target type.
     # Columns that exist ONLY in source (new features) pass through uncast —
@@ -139,10 +147,12 @@ def write_features(
     _insert_vals  = ", ".join(f"src.{c}" for c in _all_src_cols)
 
     stamped_df.createOrReplaceTempView("_features_stamped")
-    # Enable schema auto-merge so INSERT can add new columns to the target table.
-    spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
+    # Schema evolution scoped to this MERGE via SQL syntax, not the session-level
+    # spark.databricks.delta.schema.autoMerge.enabled conf — that conf is blocked
+    # on Databricks Free Edition serverless
+    # ([CONFIG_NOT_AVAILABLE.SERVERLESS_DELTA_SCHEMA_AUTO_MERGE_ENABLED]).
     spark.sql(f"""
-        MERGE INTO {full_table} tgt
+        MERGE WITH SCHEMA EVOLUTION INTO {full_table} tgt
         USING _features_stamped src
         ON  tgt.market_id      = src.market_id
         AND tgt.store_id       = src.store_id

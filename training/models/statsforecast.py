@@ -47,7 +47,7 @@ class StatsForecastModel(ForecastModel):
     """Additive trend + Fourier seasonality + event-dummy model via `statsforecast`'s MSTL."""
 
     model_type = "statsforecast"
-    evaluation_cost = 1  # MSTL vectorisable; fast per-series in batch
+    evaluation_cost = 3  # ETS-family tier — runs after lgbm/croston/elastic_net/auto_arima, before prophet
 
     def __init__(self) -> None:
         self._n: int = 0

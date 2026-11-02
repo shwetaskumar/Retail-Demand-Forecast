@@ -17,6 +17,11 @@ BUILD_PROMPTS.md
 # Local-only utilities
 uv
 
+# Kaggle M5 raw data (data/kaggle_m5/loader.py) — large, and the competition's
+# terms don't permit redistribution. Download your own copy per that module's
+# docstring; never committed.
+/data/m5_raw/
+
 # OS files
 .DS_Store
 Thumbs.db

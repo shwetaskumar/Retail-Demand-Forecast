@@ -9,7 +9,7 @@
 --      (docs/instructions.md §7 lock #3: JOB 3 is scoring-only).
 --
 -- SAFE TO RE-RUN: ADD COLUMN IF NOT EXISTS / CREATE TABLE IF NOT EXISTS are idempotent
--- on Delta tables. RUN IN DATABRICKS (this repo authors files only — see CLAUDE.md).
+-- on Delta tables. RUN IN DATABRICKS (not executed locally).
 --
 -- Existing tables are otherwise untouched: only ADD COLUMN (nullable, no default change
 -- to existing rows) on sku_store_features, and a brand-new table.

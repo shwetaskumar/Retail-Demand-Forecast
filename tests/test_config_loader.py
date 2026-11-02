@@ -3,7 +3,7 @@ tests/test_config_loader.py — unit tests for config/loader.py.
 
 Exercises `load_config` against a fake `spark` whose `.table(...).filter(...).toPandas()`
 chain is backed by a single in-memory pandas frame (the compact config table) — no
-real Spark/Delta/pyspark import required, per the EXECUTION rule in CLAUDE.md.
+real Spark/Delta/pyspark import required.
 """
 from __future__ import annotations
 
@@ -129,6 +129,26 @@ def test_load_config_excludes_series_level_override_rows():
 
     lgbm = next(m for m in config.models if m.model_type == "lgbm")
     assert lgbm.enabled is True  # market-wide row, not the series override
+
+
+def test_load_config_reads_optional_skill_thresholds():
+    """category_skill_thresholds switches named categories to the relative gate; the
+    rest keep min_skill_vs_baseline=None (absolute gate)."""
+    pdf = pd.concat([
+        _us_config_pdf(),
+        pd.DataFrame([_row("US", "category_skill_thresholds", json.dumps({"A": 0.05}))]),
+    ], ignore_index=True)
+
+    config = load_config(FakeConfigSpark(pdf), catalog="retail_forecast", market_id="US")
+
+    by_cat = {c.category: c for c in config.categories}
+    assert by_cat["A"].min_skill_vs_baseline == 0.05
+    assert by_cat["B"].min_skill_vs_baseline is None
+
+
+def test_load_config_without_skill_thresholds_keeps_absolute_gate():
+    config = load_config(FakeConfigSpark(_us_config_pdf()), catalog="retail_forecast", market_id="US")
+    assert all(c.min_skill_vs_baseline is None for c in config.categories)
 
 
 def test_load_config_raises_when_market_missing():

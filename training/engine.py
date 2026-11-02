@@ -6,15 +6,16 @@ actually calls. See fit_one_series's own docstring for why it's kept anyway.
 
 Cascade contract (§10.2 onion ordering) that both fit_one_series (here) and
 run_engine_layered (the real, Spark-distributed implementation) satisfy:
-  Layer 1: small statistical models first — AutoETS + MSTL, evaluated in one
-  vectorised batch per location. If either clears the per-series WMAPE gate, stop.
-  Layer 2: only the items that miss the statistical gate fall through to LightGBM.
-  Layer 3: only the items that still miss the gate fall through to Prophet as the
-  last resort.
+  Candidates are evaluated in ascending cost_tier order (config_model.cost_tier,
+  seeded from config/seed_defaults.py's _DEFAULT_MODEL_COST_TIERS — the config-table
+  -driven source of truth, not hardcoded here). Default cascade: lgbm (cost 0,
+  alone) -> auto_arima (2) -> statsforecast/croston/ets_event/elastic_net, one
+  merged tier (3) -> prophet, last resort (4). If any tier clears the per-series
+  WMAPE gate, evaluation stops there.
 
   Per-series early-stop threshold = category accuracy_threshold from config_category
-  (same threshold used by the cohort-level gate). After the last-resort Prophet step,
-  the best available candidate is selected even if no layer cleared the gate.
+  (same threshold used by the cohort-level gate). After the last (most expensive)
+  tier, the best available candidate is selected even if no tier cleared the gate.
 
 HPT is NOT run here — it is a post-gate conditional step in notebooks/02_train.py
 (and notebooks/05_hpt_retune.py), only triggered for series/cohorts that missed
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
 from config.loader import ForecastConfig
 from training.backtest import backtest_metrics
 from training.decomposition.decomposer import reconstruction_error, validate_decomposition
+from training.evaluation import gate_wmape_ceiling
 from training.models.base import ForecastModel
 from training.models.uplift import UpliftModel
 
@@ -82,13 +84,15 @@ OUTPUT_SCHEMA_COLUMNS = [
     "wmape_7d",
     # Supplementary diagnostics.
     "bias_pct", "naive_mae_7d",
+    # Trailing-28-day-mean baseline WMAPE on the same folds — the relative gate's yardstick.
+    "baseline_wmape_7d",
     "volume", "reconstruction_error", "passed_decomposition", "status",
 ]
 
 OUTPUT_SCHEMA = (
     "series_key string, market_id string, category string, store_id string, sku_id string, "
     "snapshot_date string, model_type string, params string, "
-    "mase_7d double, wmape_7d double, bias_pct double, naive_mae_7d double, "
+    "mase_7d double, wmape_7d double, bias_pct double, naive_mae_7d double, baseline_wmape_7d double, "
     "volume double, reconstruction_error double, passed_decomposition boolean, status string"
 )
 
@@ -107,6 +111,7 @@ def result_row(
     wmape_7d: float = float("nan"),      # WMAPE gate / planner-facing metric
     bias_pct: float = float("nan"),      # supplementary diagnostic
     naive_mae_7d: float = float("nan"),  # supplementary diagnostic
+    baseline_wmape_7d: float = float("nan"),  # relative-gate yardstick
     volume: float = 0.0,
     reconstruction_error_value: float = float("nan"),
     passed_decomposition: bool = False,
@@ -126,6 +131,7 @@ def result_row(
         "wmape_7d":             wmape_7d,
         "bias_pct":             bias_pct,
         "naive_mae_7d":         naive_mae_7d,
+        "baseline_wmape_7d":    baseline_wmape_7d,
         "volume":               volume,
         "reconstruction_error": reconstruction_error_value,
         "passed_decomposition": passed_decomposition,
@@ -168,7 +174,13 @@ def evaluate_candidate(
         decomp        = model.decompose(holdout_pdf)
         passed        = validate_decomposition(decomp, market_cfg.reconstruction_tol_pct)
         recon_err     = float(reconstruction_error(decomp).max())
-        volume        = float(series_pdf["qty"].astype(float).abs().sum())
+        # `volume` is the gate's weighting term and MUST be the last-fold holdout |qty|
+        # (training/evaluation.py's contract; training/engine_layered.py:306 uses exactly
+        # this window). Summing the whole series here — as this line did until 2026-09-10 —
+        # made HPT-retuned champions carry a full-year volume while cascade champions carried
+        # a 7-day one, so the "volume-weighted" WMAPE at every grain silently weighted retuned
+        # series ~50x more than the rest.
+        volume        = float(holdout_pdf["qty"].astype(float).abs().sum())
         # Store structured params (baseline_params + event_coefficients) rather than
         # the raw config param_space so champion_index is directly queryable.
         storable = (
@@ -184,6 +196,7 @@ def evaluate_candidate(
             wmape_7d=metrics["wmape_7d"],        # WMAPE gate / planner-facing
             bias_pct=metrics["bias_pct"],        # supplementary
             naive_mae_7d=metrics["naive_mae_7d"],  # supplementary
+            baseline_wmape_7d=metrics.get("baseline_wmape_7d", float("nan")),
             volume=volume,
             reconstruction_error_value=recon_err,
             passed_decomposition=passed,
@@ -214,6 +227,17 @@ def tag_series_key(
     if view_suffix:
         tagged.createOrReplaceTempView(f"_engine{view_suffix}")
     return tagged
+
+
+def _passes_gate(cat_cfg, row: dict, require_configured: bool = False) -> bool:
+    """Per-series gate check shared by Phase 1 (stability) and Phase 2 (early stop):
+    training/evaluation.py::gate_wmape_ceiling — relative to the row's own 28-day-mean
+    baseline when the category is in skill mode, absolute otherwise. With no gate
+    configured, Phase 1 treats it as passed while Phase 2 never early-stops."""
+    ceiling = gate_wmape_ceiling(cat_cfg, row.get("baseline_wmape_7d"))
+    if ceiling is None:
+        return not require_configured
+    return bool(row["wmape_7d"] <= ceiling)
 
 
 def fit_one_series(
@@ -261,9 +285,6 @@ def fit_one_series(
         return pd.DataFrame([result_row(*identity, model_type=None, params=None, status="insufficient_history")])
 
     cat_cfg    = next((c for c in config.categories if c.category == category), None)
-    gate_wmape = (1.0 - cat_cfg.accuracy_threshold) if (
-        cat_cfg is not None and cat_cfg.accuracy_threshold is not None
-    ) else None
     drift_tol  = cat_cfg.drift_tolerance if cat_cfg is not None else 0.05
 
     # ── PHASE 1: stability check ─────────────────────────────────────────────────────────────────
@@ -293,7 +314,7 @@ def fit_one_series(
                     and p1_row["passed_decomposition"]
                     and wmape_now == wmape_now  # not NaN
                     and wmape_now <= prev_wmape * (1.0 + drift_tol)   # relative: no worse than prev+tol
-                    and (gate_wmape is None or wmape_now <= gate_wmape)  # absolute floor
+                    and _passes_gate(cat_cfg, p1_row)  # same bar as the reported gate
                 ):
                     stable_row = dict(p1_row)
                     stable_row["status"] = "stable"
@@ -325,7 +346,7 @@ def fit_one_series(
             best_row = row
 
         # Early stop: cheapest model cleared the accuracy gate → skip remaining slower ones
-        if gate_wmape is not None and row["wmape_7d"] <= gate_wmape and row["passed_decomposition"]:
+        if row["passed_decomposition"] and _passes_gate(cat_cfg, row, require_configured=True):
             return pd.DataFrame([row])
 
     if best_row is not None:

@@ -17,10 +17,10 @@
 # MAGIC   7. Conditional HPT (only if `run_hpt=True`) — re-tunes series/cohorts that failed the gate
 # MAGIC   8. MLflow registration — one pyfunc per market×category
 # MAGIC
-# MAGIC HPT is NOT run by default. Set the `run_hpt` widget to `True` to trigger
-# MAGIC conditional Optuna re-tuning for series/cohorts that failed the gate. This
-# MAGIC keeps the weekly critical path fast; HPT is an explicit remediation step,
-# MAGIC not automatic overhead on every run.
+# MAGIC HPT runs by default (`run_hpt=True`) — conditional Optuna re-tuning still
+# MAGIC only touches series/cohorts that actually failed the gate, never a full
+# MAGIC retrain, so it stays cheap even running on every scheduled pass. Set the
+# MAGIC `run_hpt` widget to `False` to skip it for a given run.
 # MAGIC
 # MAGIC Inputs: `{catalog}.gold.sku_store_features` @ nearest snapshot_date <= as_of
 # MAGIC (exact snapshot used if available; nearest earlier snapshot used otherwise — see Step 1).
@@ -30,11 +30,11 @@
 # COMMAND ----------
 
 # DBTITLE 1,Widgets
-dbutils.widgets.text("market_id",      "US")
+dbutils.widgets.text("market_id",      "CA")
 dbutils.widgets.text("env",             "")
 dbutils.widgets.text("snapshot_date",   "")
 dbutils.widgets.text("train_start_date","")
-dbutils.widgets.text("run_hpt",         "False")
+dbutils.widgets.text("run_hpt",         "True")
 dbutils.widgets.text("use_batch_engine","False")
 
 # ── Optional debug / test scope filters ──────────────────────────────────────
@@ -52,23 +52,17 @@ dbutils.widgets.text("filter_category", "")   # e.g. "A" or "A,B"
 
 # COMMAND ----------
 
-# DBTITLE 1,Install pinned deps (interactive runs only — job clusters already have these)
-# Only install when running interactively — job clusters already have libraries
-# pre-installed via the job definition. Saves 3-5 min per notebook.run() call.
-import subprocess as _sp, os as _os
-try:
-    _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
-    _is_job = _ctx.tags().get("jobId").isDefined()
-except Exception:
-    _is_job = False
-if not _is_job:
-    _sp.check_call(["pip", "install", "-q", "-r", _os.path.join(_os.path.dirname(_os.getcwd()), "requirements.txt")])
-    dbutils.library.restartPython()
-
-# COMMAND ----------
-
-# DBTITLE 1,Restart Python (interactive only)
-# Restart merged into pip-install cell above (only runs in interactive context)
+# DBTITLE 1,Dependencies
+# Job-triggered runs get prophet/statsforecast/lightgbm/etc. from the job
+# definition's environment_key: ml_env (see databricks.yml) — no install needed
+# here. A previous version of this cell tried to detect interactive-vs-job via
+# dbutils.notebook...getContext().tags(), but that API is not whitelisted on
+# Databricks Free Edition serverless (Py4JSecurityException), so the guard
+# always evaluated as "not a job" and attempted a pip install against a
+# Workspace-relative path — which itself fails on Free Edition (Workspace
+# Files can't be open()'d for content — see the sys.path note below) and was
+# destabilizing the kernel for the next command. For interactive use, install
+# requirements.txt manually from the workspace's own Volume-synced copy.
 
 # COMMAND ----------
 
@@ -94,19 +88,29 @@ _scoped_run     = bool(filter_sku or filter_store or filter_category)
 # COMMAND ----------
 
 # DBTITLE 1,sys.path — repo root importable
+import importlib
 import os
+import shutil
 import sys
 
-# Ask the runtime for THIS notebook's own workspace path, then go up one level
-# (out of notebooks/) to the repo root. Portable across workspaces/usernames and
-# regardless of whether this is deployed via `databricks bundle deploy` or linked
-# as a Databricks Git folder (Repos) backed by Azure DevOps/GitHub — no hardcoded
-# path. __file__ is not available inside a notebook cell, which is why this asks
-# the runtime instead.
-_notebook_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
-_REPO_ROOT = "/Workspace" + os.path.dirname(os.path.dirname(_notebook_path))
+# Databricks Free Edition serverless compute can stat/list Workspace Files but
+# cannot open() them for content (java.io.FileNotFoundException wrapped as
+# "Input/output error" from SharedUCWorkspaceLocalFileSystem — a Free Edition
+# environment limitation, confirmed empirically, not specific to this repo).
+# Shared modules are synced to a UC Volume as the source of truth, but importing
+# directly off the Volume triggers Databricks' per-import autoreload-discoverability
+# hook once per module — each one a network round-trip against Volume-backed
+# storage, enough to blow the platform's 80s cell-setup budget once import
+# count grows. One bulk copy to local ephemeral disk avoids the per-import
+# overhead entirely.
+_VOLUME_ROOT = f"/Volumes/{env}/default/pylib"
+_REPO_ROOT = "/tmp/retail_forecast_pylib"
+if os.path.isdir(_REPO_ROOT):
+    shutil.rmtree(_REPO_ROOT)
+shutil.copytree(_VOLUME_ROOT, _REPO_ROOT)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+importlib.invalidate_caches()
 
 # COMMAND ----------
 
@@ -132,6 +136,26 @@ from training.evaluation import gate, write_backtest_metrics
 # DBTITLE 1,Spark session, config, run_id, timer helper
 catalog = env
 spark   = get_or_create_spark(f"job2-training-{market_id}")
+
+# sys.path only affects the DRIVER's own Python process — Spark executors run
+# in separate processes/containers that never see it (confirmed empirically:
+# an applyInPandas UDF referencing training.* raised ModuleNotFoundError until
+# this fix). Zip the local copy and ship it to every executor via Spark
+# Connect's artifact API — the serverless-native equivalent of sc.addPyFile().
+import zipfile
+_PYLIB_ZIP = "/tmp/retail_forecast_pylib.zip"
+if os.path.exists(_PYLIB_ZIP):
+    os.remove(_PYLIB_ZIP)
+with zipfile.ZipFile(_PYLIB_ZIP, "w", zipfile.ZIP_DEFLATED) as _zf:
+    for _root, _dirs, _files in os.walk(_REPO_ROOT):
+        _dirs[:] = [d for d in _dirs if d != "__pycache__"]
+        for _f in _files:
+            if _f.endswith(".pyc"):
+                continue
+            _full = os.path.join(_root, _f)
+            _zf.write(_full, os.path.relpath(_full, _REPO_ROOT))
+spark.addArtifacts(_PYLIB_ZIP, pyfile=True)
+
 logger  = get_logger(__name__, market_id=market_id, env=env)
 
 _job_t0 = _t.perf_counter()
@@ -280,15 +304,16 @@ logger.info("Step 3 skipped — prev_champions not used by engine (dead code).")
 # DBTITLE 1,Step 4 — run engine (cascade or batch)
 if use_batch_engine:
     logger.info("ENGINE mode: batch (run_engine_batch) — ETS+Ridge vectorised per store, cold-start only")
-    candidate_metrics_df = run_engine_batch(spark, training_features_df, config, as_of_str).cache()
+    candidate_metrics_df = run_engine_batch(spark, training_features_df, config, as_of_str).localCheckpoint()
 else:
     logger.info("ENGINE mode: layered (run_engine_layered) — config-driven cascade, "
                 "models from config_model grouped by evaluation_cost")
     candidate_metrics_df = run_engine_layered(
         spark, training_features_df, config, as_of_str, prev_champions=prev_champions
-    ).cache()
+    ).localCheckpoint()
 
-# Materialize once (the .cache() above ensures this is a single pass)
+# Materialize once (.localCheckpoint() above ensures this is a single pass —
+# .cache() raises NOT_SUPPORTED_WITH_SERVERLESS on Databricks Free Edition)
 total_candidates = candidate_metrics_df.count()
 logger.info(f"Engine produced {total_candidates} candidate rows total.")
 
@@ -363,9 +388,16 @@ try:
         WHERE market_id = '{market_id.replace("'", "''")}'
           AND snapshot_date = DATE('{as_of_str}')
     """)
+    # repo_root=_VOLUME_ROOT, not _REPO_ROOT: this path gets pickled into the
+    # registered pyfunc for use at PREDICT time (see mlflow_registry.py's
+    # CategoryForecasterPyfunc), potentially on a completely different compute
+    # instance long after this training run ends. _REPO_ROOT
+    # (/tmp/retail_forecast_pylib) is this container's own ephemeral local
+    # disk copy — gone the moment this run finishes. _VOLUME_ROOT is the
+    # durable, always-accessible UC Volume location.
     run_ids = register_champions_to_mlflow(
         spark, catalog, market_id, as_of_str, final_champions_df, training_features_df,
-        training_set=training_set, repo_root=_REPO_ROOT,
+        training_set=training_set, repo_root=_VOLUME_ROOT,
     )
     logger.info(f"MLflow registration complete: {len(run_ids)} categories registered")
 

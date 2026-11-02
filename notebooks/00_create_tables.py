@@ -16,22 +16,22 @@ import os
 import shutil
 import sys
 
-# ── repo root on sys.path so utils / config / data are importable ────────────
-# Ask the runtime for THIS notebook's own workspace path, then go up one level
-# (out of notebooks/) to the repo root. Portable across workspaces/usernames and
-# regardless of whether this is deployed via `databricks bundle deploy` or linked
-# as a Databricks Git folder (Repos) backed by Azure DevOps/GitHub — no hardcoded
-# path. __file__ is not available inside a notebook cell, which is why this asks
-# the runtime instead.
-_notebook_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
-_REPO_ROOT = "/Workspace" + os.path.dirname(os.path.dirname(_notebook_path))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
 # ── widget (env drives catalog name — architecture lock 10) ─────────────────
 dbutils.widgets.text("env", "")
 env     = dbutils.widgets.get("env")
 catalog = env  # catalog == env
+
+# ── repo root on sys.path so utils / config / data are importable ────────────
+# Databricks Free Edition serverless compute can stat/list Workspace Files but
+# cannot open() them for content (java.io.FileNotFoundException wrapped as
+# "Input/output error" from SharedUCWorkspaceLocalFileSystem — a Free Edition
+# environment limitation, confirmed empirically, not specific to this repo).
+# Shared modules are synced to a UC Volume (see notebooks/README or the deploy
+# notes in docs/instructions.md) instead of imported straight from the
+# bundle-deployed Workspace path.
+_REPO_ROOT = f"/Volumes/{catalog}/default/pylib"
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 # ── imports (after sys.path is set) ─────────────────────────────────────────
 import utils.io
@@ -61,6 +61,13 @@ from utils.io import run_ddl_file                 # noqa: E402
 from config.seed_defaults import seed_default_market  # noqa: E402
 
 spark = get_or_create_spark("00_create_tables")
+
+# ── schemas (lock #5: source/gold/control/forecast) — idempotent ────────────
+# `CREATE TABLE`/`saveAsTable` require the schema to already exist; the DDL
+# files below only create tables, so the four project schemas are created here.
+for _schema in ["source", "gold", "control", "forecast"]:
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{_schema}")
+print(f"Schemas ready: {catalog}.{{source,gold,control,forecast}}")
 
 # ── DDL — idempotent CREATE TABLE IF NOT EXISTS ──────────────────────────────
 run_ddl_file(spark, f"{_REPO_ROOT}/config/ddl/config_tables.sql", catalog)

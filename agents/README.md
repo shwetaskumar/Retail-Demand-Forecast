@@ -1,6 +1,6 @@
 # agents/ — PHASE 2, deferred (placeholder only)
 
-Per `docs/instructions.md` §16 and CLAUDE.md lock #11: monitoring, diagnosis,
+Per `docs/instructions.md` §16: monitoring, diagnosis,
 Genie-analysis, and feature-engineering agents are **deferred to phase 2**.
 No agent code is built now — this folder is a placeholder so the eventual
 agent layer has a home without disturbing the v1 layout.

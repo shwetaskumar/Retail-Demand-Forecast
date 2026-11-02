@@ -11,9 +11,10 @@ line-length = 120
 target-version = "py311"
 
 [lint.per-file-ignores]
-# All three scripts inject the repo root onto sys.path (for standalone `python
-# training/run_fit_*.py` / `python demo/run_local_demo.py` execution) before
+# These scripts inject the repo root onto sys.path (for standalone `python
+# training/run_fit_*.py` / `python demo/*.py` execution) before
 # importing local packages — the late import is intentional.
 "training/run_fit_local.py" = ["E402"]
 "training/run_fit_global.py" = ["E402"]
 "demo/run_local_demo.py" = ["E402"]
+"demo/compare_selection_rules.py" = ["E402"]

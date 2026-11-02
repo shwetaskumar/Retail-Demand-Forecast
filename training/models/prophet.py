@@ -46,7 +46,7 @@ class ProphetModel(ForecastModel):
     """Prophet with holiday & promo regressors in additive mode."""
 
     model_type = "prophet"
-    evaluation_cost = 3  # Stan MCMC: ~2-5s per series; evaluated last in Phase 2
+    evaluation_cost = 4  # Stan MCMC: ~2-5s per series; evaluated last in the cascade
 
     def __init__(self) -> None:
         self._model = None

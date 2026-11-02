@@ -24,7 +24,7 @@ so a series that reached Prophet has up to 4 candidate rows (stats/lgbm/uplift/
 prophet) and the best one wins; no "best so far" needs to be carried between
 passes.
 
-Decomposition gate (docs/instructions.md §10.1 / CLAUDE.md lock #7): every
+Decomposition gate (docs/instructions.md §10.1): every
 candidate's decompose() is actually called and validated here (validate_decomposition
 against reconstruction_tol_pct) — passed_decomposition/reconstruction_error are real
 per-candidate results, not a hardcoded assumption. This also means _survivors() (the
@@ -75,7 +75,13 @@ _CASCADE_MAX_FOLDS = 1
 # config_market.uplift_enabled = true. Only these interpretable, decomposable
 # bases are wrapped (never lgbm/prophet, which already carry their own capacity).
 # They run as conditional candidates on gate-missing survivors only — see run_engine_layered.
-_UPLIFT_BASES = ("ets_event", "statsforecast")
+#
+# ets_event dropped 2026-09-06: measured on the M5 recalibration run, ets_event+uplift
+# (n=16, weighted WMAPE 30.1%) was statistically indistinguishable from plain ets_event
+# (n=36, weighted WMAPE 29.9%) — the uplift wrapper spent a full Stage-2 fit + escalation
+# tier for a ~0.2pp difference. statsforecast+uplift, by contrast, is a genuine (if
+# still weak) fallback for its hardest survivors, so it stays.
+_UPLIFT_BASES = ("statsforecast",)
 _UPLIFT_SUFFIX = "+uplift"
 
 # Fallback defaults for the forecast sanity cap; the live values come from
@@ -88,71 +94,6 @@ _UPLIFT_SUFFIX = "+uplift"
 # ('forecast_cap'), so no history load is needed at scoring time.
 _FORECAST_CAP_MULT = 2.5
 _CAP_TRAILING_DAYS = 365
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Driver-side progress helper
-# ─────────────────────────────────────────────────────────────────────────────
-def _start_progress(label: str, log, accs: dict, every_s: int = 20):
-    """Background thread that prints a driver-visible status line every `every_s`
-    seconds while a pass runs. `accs` maps display-name -> Spark accumulator.
-
-    Returns a stop() callable. The counters tick because passes 2–3 are made of
-    many small tasks; each task's accumulator delta is merged into the driver
-    when that task completes.
-    """
-    stop_evt = threading.Event()
-    t0 = _time.time()
-
-    def _avg(total_key: str, n_key: str) -> float:
-        n = accs[n_key].value
-        return (accs[total_key].value / n) if n else 0.0
-
-    def _loop():
-        while not stop_evt.wait(every_s):
-            done    = accs["items"].value
-            acc     = accs["accepted"].value
-            promo   = accs["promoted"].value
-            elapsed = _time.time() - t0
-            parts = [
-                f"LAYER {label}  running",
-                f"items_done={done}",
-                f"accepted={acc}",
-                f"promoted={promo}",
-                f"elapsed={elapsed/60:.1f}min",
-            ]
-            # per-model averages, only for models this layer actually ran
-            for disp, (tk, nk) in {
-                "autoets": ("t_ets", "n_ets"),
-                "mstl":    ("t_mstl", "n_mstl"),
-                "lgbm":    ("t_lgbm", "n_lgbm"),
-                "prophet": ("t_prophet", "n_prophet"),
-            }.items():
-                if tk in accs and accs[nk].value:
-                    parts.append(f"avg_{disp}={_avg(tk, nk):.2f}s")
-            log.info("  ".join(parts))
-
-    th = threading.Thread(target=_loop, daemon=True, name=f"progress-{label}")
-    th.start()
-
-    def _stop():
-        stop_evt.set()
-        th.join(timeout=2)
-
-    return _stop
-
-
-def _make_accs(sc, models: tuple[str, ...]):
-    """Fresh accumulator set for one pass so counters don't carry across passes."""
-    accs = {
-        "items":    sc.accumulator(0),
-        "accepted": sc.accumulator(0),
-        "promoted": sc.accumulator(0),
-    }
-    for m in models:
-        accs[f"t_{m}"] = sc.accumulator(0.0)
-        accs[f"n_{m}"] = sc.accumulator(0)
-    return accs
 
 
 def _spread_apply(feat_df, n_partitions: int, udf, schema):
@@ -185,19 +126,48 @@ def _gate_map(config) -> dict[str, float | None]:
     return out
 
 
-def _survivors(spark, layer_df: "DataFrame", gate_map: dict) -> "DataFrame":
+def _skill_map(config) -> dict[str, float | None]:
+    """category -> min_skill_vs_baseline (relative gate), or None for absolute-gate categories."""
+    return {c.category: c.min_skill_vs_baseline for c in config.categories}
+
+
+def _survivors(
+    spark, layer_df: "DataFrame", gate_map: dict, margin: float = 1.0, skill_map: dict | None = None,
+) -> "DataFrame":
     """Return a 1-column DataFrame [series_key] of series to promote to the next
     layer: those that did NOT produce an 'ok' AND passed_decomposition candidate
     meeting their category gate. 'stable' and 'insufficient_history' are never
     promoted.
 
+    `margin` (config.market_config.escalation_margin, applied by the caller only
+    for the cheapest/first layer) tightens the WMAPE ceiling used for THIS
+    escalation decision only — e.g. 0.85 means a cost-0 candidate must beat
+    85% of gate_wmape, not just gate_wmape itself, to short-circuit the cascade
+    without ever trying costlier models. The actual reported gate pass/fail
+    (backtest_metrics, champion_index) is untouched — this only controls whether
+    other models get a chance to compete for a given series.
+
+    `skill_map` (category -> min_skill_vs_baseline) switches a category to the relative
+    gate: the ceiling becomes the series' own baseline_wmape_7d * (1 - min_skill), the
+    same per-series bar as training/evaluation.py::gate_wmape_ceiling. Falls back to the
+    absolute gate_wmape when the series has no baseline.
+
     Runs entirely in Spark (no driver collect) so it scales to full PL.
     """
     from pyspark.sql import functions as F
 
-    # Build a small gate lookup DataFrame (category, gate_wmape).
-    gate_rows = [(k, (float(v) if v is not None else None)) for k, v in gate_map.items()]
-    gate_df = spark.createDataFrame(gate_rows, schema="category string, gate_wmape double")
+    # Build a small gate lookup DataFrame (category, gate_wmape), margin-adjusted.
+    skill_map = skill_map or {}
+    categories = sorted(set(gate_map) | set(skill_map))
+    gate_rows = [
+        (
+            k,
+            float(gate_map[k]) * margin if gate_map.get(k) is not None else None,
+            float(skill_map[k]) if skill_map.get(k) is not None else None,
+        )
+        for k in categories
+    ]
+    gate_df = spark.createDataFrame(gate_rows, schema="category string, gate_wmape double, min_skill double")
 
     # passed_decomposition = false is excluded here too: champion.py::select_champions_spark
     # only ever selects passed_decomposition = true rows, so a low-WMAPE candidate that
@@ -206,7 +176,12 @@ def _survivors(spark, layer_df: "DataFrame", gate_map: dict) -> "DataFrame":
     # champion candidate at all.
     ok = layer_df.filter("status = 'ok' AND passed_decomposition = true")
     # min ok wmape per series
-    best = ok.groupBy("series_key", "category").agg(F.min("wmape_7d").alias("best_wmape"))
+    # baseline_wmape_7d is identical for every candidate of a series (it depends only on
+    # the folds), so max() just picks it up.
+    best = ok.groupBy("series_key", "category").agg(
+        F.min("wmape_7d").alias("best_wmape"),
+        F.max("baseline_wmape_7d").alias("baseline_wmape"),
+    )
 
     # All series this layer touched, minus terminal ones (stable / insufficient).
     touched = (
@@ -220,9 +195,14 @@ def _survivors(spark, layer_df: "DataFrame", gate_map: dict) -> "DataFrame":
         touched.join(best, ["series_key", "category"], "left")
                .join(gate_df, "category", "left")
     )
+    ceiling = F.when(
+        F.col("min_skill").isNotNull() & (F.col("baseline_wmape") > 0),
+        F.col("baseline_wmape") * (F.lit(1.0) - F.col("min_skill")) * F.lit(float(margin)),
+    ).otherwise(F.col("gate_wmape"))
+    joined = joined.withColumn("ceiling_wmape", ceiling)
     # Promote when: no ok row at all (best_wmape null), OR a gate exists and best misses it.
     promote = joined.filter(
-        "best_wmape IS NULL OR (gate_wmape IS NOT NULL AND best_wmape > gate_wmape)"
+        "best_wmape IS NULL OR (ceiling_wmape IS NOT NULL AND best_wmape > ceiling_wmape)"
     ).select("series_key").distinct()
     return promote
 
@@ -238,11 +218,10 @@ def _survivors(spark, layer_df: "DataFrame", gate_map: dict) -> "DataFrame":
 # ─────────────────────────────────────────────────────────────────────────────
 # Generic per-series layer UDF — config-driven model evaluation
 # ─────────────────────────────────────────────────────────────────────────────
-def _layer_udf_factory(config, snapshot_date, model_types, accs, timeout_s=None):
+def _layer_udf_factory(config, snapshot_date, model_types, timeout_s=None):
     """Generic UDF: for each series, try every model_type and emit candidate rows.
 
-    Uses the model registry to instantiate wrappers dynamically.  Applied via
-    _spread_apply (round-robin repartition) so progress ticks steadily on driver.
+    Uses the model registry to instantiate wrappers dynamically.
 
     Args:
         model_types: list of model_type strings to evaluate this layer.
@@ -259,14 +238,11 @@ def _layer_udf_factory(config, snapshot_date, model_types, accs, timeout_s=None)
     cap_days = getattr(config.market_config, "cap_trailing_days", _CAP_TRAILING_DAYS)
     recon_tol = config.market_config.reconstruction_tol_pct
 
-    a_items, a_acc, a_promo = accs["items"], accs["accepted"], accs["promoted"]
-    model_t_accs = {m: accs[f"t_{m}"] for m in model_types if f"t_{m}" in accs}
-    model_n_accs = {m: accs[f"n_{m}"] for m in model_types if f"n_{m}" in accs}
-
     def _udf(pdf: pd.DataFrame) -> pd.DataFrame:
         from training.evaluation import wmape as _wmape
         from training.models.registry import build as _build
         from training.decomposition.decomposer import reconstruction_error, validate_decomposition
+        from training.backtest import baseline_wmape as _baseline_wmape
         from training.backtest import rolling_origin_folds
 
         def _construct(mtype: str):
@@ -323,7 +299,6 @@ def _layer_udf_factory(config, snapshot_date, model_types, accs, timeout_s=None)
             return pd.DataFrame(columns=OUTPUT_SCHEMA_COLUMNS)
         pdf = pdf[pdf["isActive"] == 1].assign(date_id=lambda d: pd.to_datetime(d["date_id"]))
         rows: list[dict] = []
-        n_items = n_acc = n_promo = 0
 
         for k, g in pdf.groupby("series_key", sort=False):
             g = g.sort_values("date_id").reset_index(drop=True)
@@ -335,14 +310,12 @@ def _layer_udf_factory(config, snapshot_date, model_types, accs, timeout_s=None)
             if len(g) < horizon * 2:
                 rows.append(result_row(*ident, model_type=None, params=None,
                                        status="insufficient_history"))
-                n_items += 1
                 continue
 
             folds = rolling_origin_folds(g, _CASCADE_MAX_FOLDS, val_weeks, horizon)
             if not folds:
                 rows.append(result_row(*ident, model_type=None, params=None,
                                        status="insufficient_history"))
-                n_items += 1
                 continue
 
             # Per-fold naive (lag-7) MAE — shared across every candidate model this
@@ -358,6 +331,11 @@ def _layer_udf_factory(config, snapshot_date, model_types, accs, timeout_s=None)
                         nm = float(np.abs(actual_f.values - naive_fc_f).mean())
                 fold_naive_maes.append(nm)
             naive_mae_avg = float(np.nanmean(fold_naive_maes)) if fold_naive_maes else float("nan")
+            # Trailing-28-day-mean baseline WMAPE on the same folds (relative-gate yardstick);
+            # like the naive MAE above it depends only on the folds, not on any candidate.
+            _fold_base = [_baseline_wmape(tr_f, ho_f) for tr_f, ho_f in folds]
+            _fold_base = [b for b in _fold_base if b == b]
+            baseline_avg = float(np.mean(_fold_base)) if _fold_base else float("nan")
 
             # Volume + forecast cap from the LAST (most recent) fold — the same
             # window the single-fold cascade always used as its reference point.
@@ -371,9 +349,7 @@ def _layer_udf_factory(config, snapshot_date, model_types, accs, timeout_s=None)
                 else None
             )
 
-            any_ok = False
             for mtype in model_types:
-                _t = _time.time()
                 ok_row = None
                 try:
                     if timeout_s is not None:
@@ -398,6 +374,7 @@ def _layer_udf_factory(config, snapshot_date, model_types, accs, timeout_s=None)
                             recon_err = float(reconstruction_error(decomp).max())
                             ok_row = result_row(*ident, model_type=mtype, params=params,
                                                mase_7d=mase, wmape_7d=w, bias_pct=bias, naive_mae_7d=naive_mae_avg,
+                                               baseline_wmape_7d=baseline_avg,
                                                volume=vol, reconstruction_error_value=recon_err,
                                                passed_decomposition=passed, status="ok")
                         else:
@@ -412,31 +389,16 @@ def _layer_udf_factory(config, snapshot_date, model_types, accs, timeout_s=None)
                         recon_err = float(reconstruction_error(decomp).max())
                         ok_row = result_row(*ident, model_type=mtype, params=params,
                                            mase_7d=mase, wmape_7d=w, bias_pct=bias, naive_mae_7d=naive_mae_avg,
+                                               baseline_wmape_7d=baseline_avg,
                                            volume=vol, reconstruction_error_value=recon_err,
                                            passed_decomposition=passed, status="ok")
                 except Exception:
                     rows.append(result_row(*ident, model_type=mtype, params=None,
                                            volume=vol, status=f"{mtype}_failed"))
 
-                elapsed = _time.time() - _t
-                if mtype in model_t_accs:
-                    model_t_accs[mtype].add(elapsed)
-                if mtype in model_n_accs:
-                    model_n_accs[mtype].add(1)
-
                 if ok_row is not None:
                     rows.append(ok_row)
-                    any_ok = True
 
-            n_items += 1
-            if any_ok:
-                n_acc += 1
-            else:
-                n_promo += 1
-
-        a_items.add(n_items)
-        a_acc.add(n_acc)
-        a_promo.add(n_promo)
         return pd.DataFrame(rows) if rows else pd.DataFrame(columns=OUTPUT_SCHEMA_COLUMNS)
 
     return _udf
@@ -459,10 +421,13 @@ def run_engine_layered(
     Models are instantiated from training/models/registry.py — adding a new model
     only requires a wrapper file + a row in config_model.  Zero code changes.
 
-    Layer grouping by evaluation_cost (from each model class):
-      - Cost 0-1 (fast): All batch-capable / per-series-fast models in one pass.
-      - Cost 2 (medium): Per-series models like LightGBM — survivors only.
-      - Cost 3 (slow): Last-resort models like Prophet (with timeout) — survivors only.
+    Layer grouping by cost_tier (config_model.cost_tier, falling back to each model
+    class's evaluation_cost default when not set in config — see config/seed_defaults.py's
+    _DEFAULT_MODEL_COST_TIERS, the config-table-driven source of truth for this order):
+      - Cost 0 (fastest, alone): lgbm — evaluated first, on the full active series set.
+      - Cost 2 (medium): auto_arima — survivors only.
+      - Cost 3 (merged tier): statsforecast, croston, ets_event, elastic_net — survivors only.
+      - Cost 4 (slow, last resort): prophet (with timeout) — survivors only.
 
     Adding a new model:
       1. Write training/models/<name>.py with model_type = "<name>"
@@ -472,8 +437,8 @@ def run_engine_layered(
     from pyspark.sql import functions as F
 
     log = get_logger(__name__, market_id=config.market_config.market_id)
-    sc  = spark.sparkContext
     gmap = _gate_map(config)
+    smap = _skill_map(config)
     registry = _get_registry()
 
     # ── Resolve enabled models from config, grouped by cost tier ──────────────
@@ -498,27 +463,27 @@ def run_engine_layered(
         layer_cost = 1 if cost <= 1 else cost
         cost_groups.setdefault(layer_cost, []).append(m.model_type)
 
-    # ── Stage-2 uplift as CONDITIONAL escalation candidates (§10.2 pt 4) ──────
     # ── Stage-2 uplift as its OWN escalation tier (§10.2 pt 4) ────────────────
-    # Uplift is MORE expensive than plain LightGBM (each candidate = a Stage-1 stat
-    # refit + a residual LightGBM), so it must not share LightGBM's tier. Insert it
-    # ABOVE lgbm (cost 2) but BELOW prophet: bump any existing cost>=3 tier up by
-    # one, then place uplift at cost 3. Resulting cascade:
-    #     stats(1) -> lgbm(2) -> uplift(3) -> prophet(4)
-    # Each heavier tier runs only on the survivors the cheaper tiers could not
-    # gate-pass, so the slowest models touch the fewest series. This is what keeps
-    # the uplift/residual fits off the full 63K stats-failure set — they only see
-    # the series LightGBM ALSO could not push under the gate.
+    # _UPLIFT_BASES wraps the ETS-family models (ets_event, statsforecast) — uplift
+    # is a residual learner on TOP of one of those, so it must run strictly AFTER
+    # its own base models' tier (escalation only kicks in once the plain stats
+    # candidate has already had its shot), never sharing that tier or running before
+    # it. Insert dynamically at (max base tier + 1) — relative to wherever
+    # config_model.cost_tier actually placed the base models, not a hardcoded
+    # position, so re-ordering the cascade in config never desyncs this insertion.
+    # Every tier at or above the insertion point shifts up by one to make room.
     if config.market_config.uplift_enabled:
         enabled_types = {m.model_type for m in enabled}
         uplift_bases = [b for b in _UPLIFT_BASES if b in enabled_types]
         if uplift_bases:
             uplift_types = [f"{b}+uplift" for b in uplift_bases]
+            base_tiers = [c for c, types in cost_groups.items() if any(b in types for b in uplift_bases)]
+            insert_at = (max(base_tiers) if base_tiers else 0) + 1
             for c in sorted(cost_groups, reverse=True):
-                if c >= 3:
+                if c >= insert_at:
                     cost_groups[c + 1] = cost_groups.pop(c)
-            cost_groups[3] = uplift_types
-            log.info(f"UPLIFT enabled: uplift tier {uplift_types} at cost 3 (runs on lgbm-survivors only)")
+            cost_groups[insert_at] = uplift_types
+            log.info(f"UPLIFT enabled: uplift tier {uplift_types} at cost {insert_at} (runs on {uplift_bases}-survivors only)")
 
     layers = sorted(cost_groups.items())  # [(cost, [model_types]), ...]
     log.info(f"CONFIG-DRIVEN layers: {[(c, mt) for c, mt in layers]}")
@@ -528,7 +493,9 @@ def run_engine_layered(
     parts = partitions_per_cost or default_parts
 
     # ── Tag series keys + cache input ────────────────────────────────────────
-    tagged = tag_series_key(spark, features_df, config.market_config.market_id, "_layered_input").cache()
+    # .localCheckpoint() not .cache() — .cache() raises NOT_SUPPORTED_WITH_SERVERLESS
+    # on Databricks Free Edition serverless compute (Spark Connect).
+    tagged = tag_series_key(spark, features_df, config.market_config.market_id, "_layered_input").localCheckpoint()
     total_active = tagged.filter("isActive = 1").select("series_key").distinct().count()
     log.info(f"LAYERED start  active_series={total_active}  snapshot={snapshot_date}  "
              f"market_id={config.market_config.market_id}  "
@@ -553,10 +520,6 @@ def run_engine_layered(
             feat_df = tagged
             n_surv = total_active
 
-        # Build accumulators for this layer
-        accs = _make_accs(sc, tuple(model_types))
-        stop = _start_progress(layer_label, log, accs)
-
         # Determine timeout (only for cost >= 3 — slow models like Prophet)
         timeout = _PROPHET_TIMEOUT_S if cost >= 3 else None
 
@@ -564,19 +527,10 @@ def run_engine_layered(
         n_parts = max(1, min(parts.get(cost, 2000), n_surv))
         layer_df = _spread_apply(
             feat_df, n_parts,
-            _layer_udf_factory(config, snapshot_date, model_types, accs, timeout_s=timeout),
+            _layer_udf_factory(config, snapshot_date, model_types, timeout_s=timeout),
             OUTPUT_SCHEMA,
-        ).cache()
+        ).localCheckpoint()
         layer_df.count()
-        stop()
-
-        # Log layer summary with per-model timing
-        timing_parts = []
-        for mt in model_types:
-            t_key, n_key = f"t_{mt}", f"n_{mt}"
-            if t_key in accs and accs[n_key].value > 0:
-                avg = accs[t_key].value / accs[n_key].value
-                timing_parts.append(f"avg_{mt}={avg:.2f}s")
 
         # Threshold-based escalation: promote a series to the next (heavier) layer
         # when its best ok candidate MISSES its category gate (WMAPE > gate_wmape),
@@ -584,11 +538,20 @@ def run_engine_layered(
         # cheap stat model can't push under 5%/15% actually reach LightGBM/Prophet.
         # `_survivors` also promotes series with no ok row at all; 'stable' and
         # 'insufficient_history' are never promoted. Runs entirely in Spark.
-        survivors = _survivors(spark, layer_df, gmap).cache()
+        # escalation_margin only applies at the cheapest tier (layer_idx 0) — a
+        # merely-adequate lgbm result shouldn't preempt genuinely better classical
+        # models without ever letting them compete (see _survivors' docstring).
+        _margin = config.market_config.escalation_margin if layer_idx == 0 else 1.0
+        survivors = _survivors(spark, layer_df, gmap, margin=_margin, skill_map=smap).localCheckpoint()
         n_surv_next = survivors.count()
-        log.info(f"LAYER {layer_label} DONE  items={accs['items'].value}  "
-                 f"accepted={accs['accepted'].value}  no_valid_candidate={n_surv_next}  "
-                 f"elapsed={(_time.time()-job_t0)/60:.1f}min  {' '.join(timing_parts)}")
+        # items entering this layer (n_surv) vs. still without a valid champion
+        # candidate afterward (n_surv_next, promoted to the next layer) — computed
+        # from already-materialized counts rather than live Spark accumulators,
+        # which Databricks Free Edition serverless (Spark Connect) does not support
+        # (spark.sparkContext access itself raises JVM_ATTRIBUTE_NOT_SUPPORTED).
+        log.info(f"LAYER {layer_label} DONE  items={n_surv}  "
+                 f"resolved={n_surv - n_surv_next}  no_valid_candidate={n_surv_next}  "
+                 f"elapsed={(_time.time()-job_t0)/60:.1f}min")
 
         all_layer_dfs.append(layer_df)
 

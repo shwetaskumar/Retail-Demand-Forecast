@@ -2,8 +2,18 @@
 training/evaluation.py — volume-weighted 7-day WMAPE gate at 3 grains (docs/instructions.md §3, §21).
 
 Grains: category_cohort, market_sku, market_store_sku. Each is gated
-against its category's accuracy_threshold from config_category. Writes
-backtest_metrics with per-level pass/fail.
+against its category's config (CategoryConfig). Writes backtest_metrics with
+per-level pass/fail. Two gate modes, chosen per category by config:
+
+  - Relative / skill gate (when `min_skill_vs_baseline` is set — the default seed):
+    passed iff  skill = 1 - wmape / baseline_wmape  >=  min_skill_vs_baseline, where
+    baseline_wmape is the trailing-28-day-mean baseline's WMAPE on the same backtest
+    folds (training/backtest.py::baseline_wmape). Fixed absolute targets are not
+    achievable at store×sku daily grain on sparse retail data — Poisson sampling noise
+    alone exceeds them for a typical series — so the gate asks the question that is
+    always answerable: does the model add value over the naive forecast, by how much?
+  - Absolute gate (legacy, when min_skill_vs_baseline is None, or when an older engine
+    row carries no baseline): passed iff 1 - wmape >= accuracy_threshold.
 
 `gate` takes per-series CHAMPION metrics (training/champion.py's
 select_champions/select_champions_spark output — one row per series, with
@@ -120,6 +130,46 @@ def mase(actual: pd.Series, predicted: pd.Series, naive_mae: float) -> float:
     return mae_val / naive_mae
 
 
+def gate_wmape_ceiling(cat_cfg: "CategoryConfig | None", baseline_wmape: float | None = None) -> float | None:
+    """Max WMAPE a single series may have and still pass its category's gate.
+
+    Relative mode: baseline_wmape * (1 - min_skill_vs_baseline). Absolute mode (or no
+    usable baseline): 1 - accuracy_threshold. None when nothing is configured. Shared by
+    the cascade early-stop (training/engine.py, training/engine_layered.py) so per-series
+    escalation uses exactly the same bar as the reported gate.
+    """
+    if cat_cfg is None:
+        return None
+    skill = cat_cfg.min_skill_vs_baseline
+    if skill is not None and baseline_wmape is not None and baseline_wmape == baseline_wmape and baseline_wmape > 0:
+        return float(baseline_wmape) * (1.0 - float(skill))
+    if cat_cfg.accuracy_threshold:
+        return 1.0 - float(cat_cfg.accuracy_threshold)
+    return None
+
+
+def _volume_weighted_skill(group: pd.DataFrame) -> tuple[float, float]:
+    """(baseline_wmape, skill) over the rows that carry both metrics, volume-weighted the
+    same way as WMAPE so the two are directly comparable. NaN pair when unavailable."""
+    nan = float("nan")
+    if "baseline_wmape_7d" not in group.columns:
+        return nan, nan
+    valid = group[group["wmape_7d"].notna() & group["baseline_wmape_7d"].notna()]
+    if valid.empty:
+        return nan, nan
+    # `volume` is the LAST fold's holdout qty, while both WMAPEs average all folds — a
+    # series whose last week happened to sell nothing still has a well-defined skill, so
+    # fall back to equal weights rather than dropping it.
+    weights = valid["volume"].clip(lower=0)
+    if weights.sum() == 0:
+        weights = pd.Series(1.0, index=valid.index)
+    model_w = float((valid["wmape_7d"] * weights).sum() / weights.sum())
+    base_w = float((valid["baseline_wmape_7d"] * weights).sum() / weights.sum())
+    if base_w <= 0:
+        return base_w, nan
+    return base_w, 1.0 - model_w / base_w
+
+
 def _volume_weighted_wmape(group: pd.DataFrame) -> float:
     total_volume = group["volume"].sum()
     if total_volume == 0:
@@ -163,7 +213,7 @@ def _grain_rows(
     champions_pdf: pd.DataFrame,
     grain: str,
     group_cols: list[str],
-    threshold_by_category: dict,
+    category_by_key: dict,
 ) -> list[dict]:
     rows = []
     for keys, group in champions_pdf.groupby(group_cols):
@@ -175,10 +225,18 @@ def _grain_rows(
 
         wmape_value = _volume_weighted_wmape(group)
         volume = float(group["volume"].sum())
-        threshold = threshold_by_category.get((market, category))
+        cat_cfg = category_by_key.get((market, category))
+        threshold = cat_cfg.accuracy_threshold if cat_cfg is not None else None
+        min_skill = cat_cfg.min_skill_vs_baseline if cat_cfg is not None else None
+        baseline_value, skill_value = _volume_weighted_skill(group)
 
-        # ── GATE: WMAPE only — planners read this for lag-1 and lag-2 ──────────
-        passed = None if threshold is None or pd.isna(wmape_value) else bool((1 - wmape_value) >= threshold)
+        # ── GATE: relative skill vs baseline when configured, else absolute WMAPE ──
+        if min_skill is not None and not pd.isna(skill_value):
+            passed = bool(skill_value >= min_skill)
+        elif threshold is None or pd.isna(wmape_value):
+            passed = None
+        else:
+            passed = bool((1 - wmape_value) >= threshold)
 
         # ── Supplementary diagnostics (no gate role) ───────────────────────────
         bias_value = _volume_weighted_bias(group)
@@ -194,6 +252,9 @@ def _grain_rows(
                 "wmape": wmape_value,
                 "volume": volume,
                 "threshold": threshold,
+                "baseline_wmape": baseline_value,
+                "skill": skill_value,
+                "min_skill": min_skill,
                 "passed": passed,
                 "bias_pct": bias_value,      # supplementary — NOT a gate column
                 "mase_7d": mase_value,        # supplementary — NOT a gate column
@@ -205,7 +266,9 @@ def _grain_rows(
 def gate(champions_pdf: pd.DataFrame, categories: list[CategoryConfig]) -> pd.DataFrame:
     """Compute volume-weighted 7-day WMAPE at all three grains (category_cohort, market_sku,
     market_store_sku) from per-series champion metrics, and compare each to its
-    category's accuracy_threshold.
+    category's gate: relative skill vs the 28-day-mean baseline when the category sets
+    min_skill_vs_baseline (requires `baseline_wmape_7d` per series), otherwise the
+    absolute accuracy_threshold. See the module docstring.
 
     `champions_pdf` must carry: market_id, category, sku_id, series_key, wmape_7d, volume.
     Optional supplementary columns (produced by newer engine versions):
@@ -219,16 +282,17 @@ def gate(champions_pdf: pd.DataFrame, categories: list[CategoryConfig]) -> pd.Da
         return pd.DataFrame(
             columns=[
                 "market_id", "category", "grain", "entity_key", "horizon",
-                "wmape", "volume", "threshold", "passed", "bias_pct", "mase_7d",
+                "wmape", "volume", "threshold", "baseline_wmape", "skill", "min_skill",
+                "passed", "bias_pct", "mase_7d",
             ]
         )
 
-    threshold_by_category = {(c.market_id, c.category): c.accuracy_threshold for c in categories}
+    category_by_key = {(c.market_id, c.category): c for c in categories}
 
     rows: list[dict] = []
-    rows += _grain_rows(champions_pdf, "market_store_sku", ["market_id", "category", "series_key"], threshold_by_category)
-    rows += _grain_rows(champions_pdf, "market_sku", ["market_id", "category", "sku_id"], threshold_by_category)
-    rows += _grain_rows(champions_pdf, "category_cohort", ["market_id", "category"], threshold_by_category)
+    rows += _grain_rows(champions_pdf, "market_store_sku", ["market_id", "category", "series_key"], category_by_key)
+    rows += _grain_rows(champions_pdf, "market_sku", ["market_id", "category", "sku_id"], category_by_key)
+    rows += _grain_rows(champions_pdf, "category_cohort", ["market_id", "category"], category_by_key)
     return pd.DataFrame(rows)
 
 
@@ -254,8 +318,10 @@ def write_backtest_metrics(
         "snapshot_date", "run_id", "market_id", "category", "grain", "entity_key",
         "horizon", "wmape", "volume", "threshold", "passed",
         "bias_pct", "mase_7d",   # supplementary — nullable on older rows
+        "baseline_wmape", "skill", "min_skill",  # relative gate — config/ddl/migrate_v3_skill_gate.sql
     ]
     # Only include supplementary columns if present (forward-compatible with old engine output).
     available = [c for c in columns if c in to_write.columns]
     spark_df = spark.createDataFrame(to_write[available])
-    merge_upsert(spark, spark_df, catalog, _SCHEMA, _TABLE, merge_keys=["snapshot_date", "run_id", "market_id", "category", "grain", "entity_key"])
+    merge_upsert(spark, spark_df, catalog, _SCHEMA, _TABLE, merge_keys=["snapshot_date", "run_id", "market_id", "category", "grain", "entity_key"],
+                 merge_schema=True)  # additive relative-gate columns on pre-v3 tables

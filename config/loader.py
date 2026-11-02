@@ -61,6 +61,13 @@ class MarketConfig:
     max_champion_bias: float = 0.5   # champion selection deprioritises |holdout bias| above this
     forecast_cap_mult: float = 2.5   # inference clips daily yhat to this × trailing max daily demand
     cap_trailing_days: int = 365     # trailing window for the forecast-cap ceiling
+    # A cheap-tier (e.g. lgbm, cost=0) candidate only short-circuits the cascade
+    # without trying costlier models if it beats gate_wmape * escalation_margin,
+    # not just gate_wmape itself — 1.0 (default) preserves the original
+    # "first pass wins" behavior; <1.0 (e.g. 0.85) requires a comfortable margin
+    # before skipping the comparison against classical models at higher tiers,
+    # so a merely-adequate cheap model doesn't preempt a genuinely better one.
+    escalation_margin: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -74,6 +81,12 @@ class CategoryConfig:
     gate_grains: list[str]
     series_grain: str
     drift_tolerance: float  # Phase 1: max fractional WMAPE degradation vs previous champion
+    # Relative ("skill") gate: when set, a grain passes iff its WMAPE beats the trailing
+    # 28-day-mean baseline's WMAPE by at least this fraction, i.e.
+    # 1 - wmape / baseline_wmape >= min_skill_vs_baseline. Replaces the absolute
+    # accuracy_threshold for pass/fail (accuracy_threshold is then informational only).
+    # None => legacy absolute gate. See training/evaluation.py::gate_wmape_ceiling.
+    min_skill_vs_baseline: float | None = None
 
 
 @dataclass(frozen=True)
@@ -183,6 +196,7 @@ def _load_config_compact(full_pdf: pd.DataFrame, market_id: str) -> ForecastConf
         max_champion_bias=float(ms.get("max_champion_bias", 0.5)),
         forecast_cap_mult=float(ms.get("forecast_cap_mult", 2.5)),
         cap_trailing_days=int(ms.get("cap_trailing_days", 365)),
+        escalation_margin=float(ms.get("escalation_margin", 1.0)),
     )
 
     # ── models (JSON object: {model_type: cost_tier}) ──
@@ -216,6 +230,8 @@ def _load_config_compact(full_pdf: pd.DataFrame, market_id: str) -> ForecastConf
 
     # ── category thresholds (JSON object: {category: threshold}) ──
     thresholds = _parse_json(params.get("category_thresholds"), {})
+    # Optional relative gate (JSON object: {category: min_skill_vs_baseline}).
+    skill_thresholds = _parse_json(params.get("category_skill_thresholds"), {})
     categories = [
         CategoryConfig(
             market_id=market_id,
@@ -224,6 +240,9 @@ def _load_config_compact(full_pdf: pd.DataFrame, market_id: str) -> ForecastConf
             gate_grains=["category_cohort", "market_sku", "market_store_sku"],
             series_grain="market_store_sku",
             drift_tolerance=0.05,
+            min_skill_vs_baseline=(
+                float(skill_thresholds[cat]) if skill_thresholds.get(cat) is not None else None
+            ),
         )
         for cat, thresh in thresholds.items()
     ]

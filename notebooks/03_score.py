@@ -18,7 +18,7 @@
 # COMMAND ----------
 
 # DBTITLE 1,Widgets
-dbutils.widgets.text("market_id", "US")
+dbutils.widgets.text("market_id", "CA")
 dbutils.widgets.text("env", "")
 dbutils.widgets.text("snapshot_date", "")
 
@@ -35,12 +35,17 @@ display(dbutils.widgets.getAll())
 
 # COMMAND ----------
 
-# DBTITLE 1,Install pinned deps (interactive runs only — job clusters already have these)
-# MAGIC %pip install -r ../requirements.txt
-
-# COMMAND ----------
-
-dbutils.library.restartPython()
+# DBTITLE 1,Dependencies
+# Job-triggered runs get prophet/statsforecast/lightgbm/etc. from the job
+# definition's environment_key: ml_env (see databricks.yml) — no install needed
+# here. A previous version of this cell tried to detect interactive-vs-job via
+# dbutils.notebook...getContext().tags(), but that API is not whitelisted on
+# Databricks Free Edition serverless (Py4JSecurityException), so the guard
+# always evaluated as "not a job" and attempted a pip install against a
+# Workspace-relative path — which itself fails on Free Edition (Workspace
+# Files can't be open()'d for content — see the sys.path note below) and was
+# destabilizing the kernel for the next command. For interactive use, install
+# requirements.txt manually from the workspace's own Volume-synced copy.
 
 # COMMAND ----------
 
@@ -63,19 +68,29 @@ _scoped_run     = bool(filter_sku or filter_store or filter_category)
 # COMMAND ----------
 
 # DBTITLE 1,sys.path — repo root importable
+import importlib
 import os
+import shutil
 import sys
 
-# Ask the runtime for THIS notebook's own workspace path, then go up one level
-# (out of notebooks/) to the repo root. Portable across workspaces/usernames and
-# regardless of whether this is deployed via `databricks bundle deploy` or linked
-# as a Databricks Git folder (Repos) backed by Azure DevOps/GitHub — no hardcoded
-# path. __file__ is not available inside a notebook cell, which is why this asks
-# the runtime instead.
-_notebook_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
-_REPO_ROOT = "/Workspace" + os.path.dirname(os.path.dirname(_notebook_path))
+# Databricks Free Edition serverless compute can stat/list Workspace Files but
+# cannot open() them for content (java.io.FileNotFoundException wrapped as
+# "Input/output error" from SharedUCWorkspaceLocalFileSystem — a Free Edition
+# environment limitation, confirmed empirically, not specific to this repo).
+# Shared modules are synced to a UC Volume as the source of truth, but importing
+# directly off the Volume triggers Databricks' per-import autoreload-discoverability
+# hook once per module — each one a network round-trip against Volume-backed
+# storage, enough to blow the platform's 80s cell-setup budget once import
+# count grows. One bulk copy to local ephemeral disk avoids the per-import
+# overhead entirely.
+_VOLUME_ROOT = f"/Volumes/{env}/default/pylib"
+_REPO_ROOT = "/tmp/retail_forecast_pylib"
+if os.path.isdir(_REPO_ROOT):
+    shutil.rmtree(_REPO_ROOT)
+shutil.copytree(_VOLUME_ROOT, _REPO_ROOT)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+importlib.invalidate_caches()
 
 # COMMAND ----------
 
@@ -100,6 +115,26 @@ from inference.future_spine import build_future_spine
 # DBTITLE 1,Spark session, config
 catalog = env
 spark   = get_or_create_spark(f"job3-inference-{market_id}")
+
+# sys.path only affects the DRIVER's own Python process — Spark executors run
+# in separate processes/containers that never see it (confirmed empirically:
+# an applyInPandas UDF referencing inference.* raised ModuleNotFoundError
+# until this fix). Zip the local copy and ship it to every executor via Spark
+# Connect's artifact API — the serverless-native equivalent of sc.addPyFile().
+import zipfile
+_PYLIB_ZIP = "/tmp/retail_forecast_pylib.zip"
+if os.path.exists(_PYLIB_ZIP):
+    os.remove(_PYLIB_ZIP)
+with zipfile.ZipFile(_PYLIB_ZIP, "w", zipfile.ZIP_DEFLATED) as _zf:
+    for _root, _dirs, _files in os.walk(_REPO_ROOT):
+        _dirs[:] = [d for d in _dirs if d != "__pycache__"]
+        for _f in _files:
+            if _f.endswith(".pyc"):
+                continue
+            _full = os.path.join(_root, _f)
+            _zf.write(_full, os.path.relpath(_full, _REPO_ROOT))
+spark.addArtifacts(_PYLIB_ZIP, pyfile=True)
+
 logger  = get_logger(__name__, market_id=market_id, env=env)
 
 as_of     = resolve_snapshot_date(snapshot_date)
@@ -229,10 +264,6 @@ logger.info(
     f"{' + scoring_failures (' + str(n_failed) + ' rows)' if n_failed else ''}"
 )
 
-# Release the persisted scored result + champion cache now that both the
-# count() logs and the MERGE have consumed them.
-spark.catalog.clearCache()
-
 _total = _time.perf_counter() - _t0
 logger.info(
     f"JOB 3 INFERENCE complete market_id={market_id} snapshot_date={as_of_str} "
@@ -267,6 +298,7 @@ from pyspark.sql import functions as _F
 from pyspark.sql.types import (
     StructType, StructField, StringType, DateType, DoubleType, IntegerType
 )
+from pyspark.sql.window import Window
 
 from training.models.registry import build as _registry_build, get_registry as _get_registry
 from training.models.uplift import UpliftModel as _UpliftModel
@@ -310,8 +342,13 @@ _features_bc = (
 )
 
 # ── 3. Join features with champion metadata ──────────────────────────────────
+# _features_bc already carries its own `category` (from sku_store_features, as
+# currently classified); drop it before the join so the champion's `category`
+# (as classified when it was trained/gated — the one actually wanted here) is
+# the only one left, avoiding an AMBIGUOUS_REFERENCE downstream.
 _combined_bc = (
     _features_bc
+    .drop("category")
     .join(
         _champions_bc.select("store_id", "sku_id", "model_type", "params", "category"),
         on=["store_id", "sku_id"],
@@ -477,8 +514,8 @@ _backcast_raw = (
     _combined_bc
     .groupBy("store_id", "sku_id")
     .applyInPandas(_backcast_one_series, schema=_BACKCAST_SCHEMA)
+    .localCheckpoint()  # .cache() raises NOT_SUPPORTED_WITH_SERVERLESS on Free Edition
 )
-_backcast_raw.cache()
 _n_total = _backcast_raw.count()
 _t_bc = _time.perf_counter() - _t_bc0
 
@@ -517,13 +554,11 @@ _backcast_decomp_out = (
         _F.lit("backcast").alias("updated_by"),
     )
 )
-_backcast_decomp_out.write.format("delta").mode("append").saveAsTable(
+_backcast_decomp_out.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(
     f"{catalog}.forecast.decomposition"
 )
 logger.info(f"BACKCAST decomposition written: {_n_decomp:,} rows (run_id={_bc_run_id})")
 
-# ── Cleanup ──────────────────────────────────────────────────────────────────
-_backcast_raw.unpersist()
 logger.info("BACKCAST complete.")
 
 

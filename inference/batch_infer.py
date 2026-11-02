@@ -158,7 +158,7 @@ def _spread_score(combined_df: "DataFrame", n_partitions: int, udf, schema) -> "
     training time (pmod(hash(series_key), n_partitions) so every row of a series still
     lands in the same task, while spreading series far more evenly than the default
     shuffle-partition count) — reimplemented locally rather than imported, since JOB 2
-    (training) and JOB 3 (inference) must stay independent (CLAUDE.md lock #3).
+    (training) and JOB 3 (inference) must stay independent.
     """
     from pyspark.sql import functions as F
 
@@ -464,7 +464,6 @@ def score(
     """
     from pyspark.sql import functions as _F
     from pyspark.sql.window import Window as _Window
-    from pyspark.storagelevel import StorageLevel
 
     logger = get_logger("inference.batch_infer", env=catalog)
     safe_market_id = config.market_config.market_id.replace("'", "''")
@@ -497,7 +496,7 @@ def score(
                END AS needs_history
         FROM ranked
         WHERE rn = 1
-    """).cache()
+    """).localCheckpoint()  # .cache() raises NOT_SUPPORTED_WITH_SERVERLESS on Free Edition
     champions_df.createOrReplaceTempView("_binfer_champions")
 
     # Cheap up-front diagnostic: how many series will REFIT (no artifact) vs
@@ -559,7 +558,10 @@ def score(
         .withColumn("_rn", _F.row_number().over(_Window.partitionBy("series_key").orderBy("date_id")))
         .withColumn("qty", _F.lit(None).cast("float"))
         .withColumn("isActive", _F.lit(None).cast("int"))
-        .persist(StorageLevel.MEMORY_AND_DISK)   # reused by both branches; computes the window once
+        # .localCheckpoint() not .persist() — .persist(StorageLevel) raises
+        # NOT_SUPPORTED_WITH_SERVERLESS on Databricks Free Edition serverless
+        # compute; reused by both branches below, computes the window once.
+        .localCheckpoint()
     )
 
     # (b) params onto the first row only: broadcast the SMALL first-row frame,
@@ -590,9 +592,10 @@ def score(
     )
 
     # ── Materialize ONCE. Without this, every downstream count()/MERGE re-runs
-    #    the entire pandas UDF (previously ~4×). Persist to disk+memory so the
-    #    expensive per-series work happens a single time.
-    scored_df = scored_df.persist(StorageLevel.MEMORY_AND_DISK)
+    #    the entire pandas UDF (previously ~4×). localCheckpoint() (not
+    #    .persist() — see the note above) so the expensive per-series work
+    #    happens a single time.
+    scored_df = scored_df.localCheckpoint()
     n_rows = scored_df.count()  # the one and only trigger of the UDF
     n_series_scored = scored_df.select("series_key").distinct().count()
     logger.info(

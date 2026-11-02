@@ -47,9 +47,13 @@ class ForecastModel(abc.ABC):
 
     Class attributes every subclass must declare:
       model_type      (str)  — unique key used in config_model.model_type and registry lookup.
-      evaluation_cost (int)  — autonomous ordering in Phase 2: 1 = batch/fast (statsforecast family),
-                               2 = per-series/medium (LightGBM, AutoARIMA), 3 = per-series/slow
-                               (Prophet Stan MCMC).  Engine sorts ascending; no user config needed.
+      evaluation_cost (int)  — autonomous cascade ordering: 0 = lgbm (evaluated first, alone —
+                               nothing else shares cost 0/1), 2 = auto_arima, 3 = statsforecast/
+                               croston/ets_event/elastic_net (one merged tier), 4 = prophet
+                               (Stan MCMC, evaluated last).  Engine sorts ascending; this class
+                               default is only a fallback — config/seed_defaults.py's
+                               _DEFAULT_MODEL_COST_TIERS (seeded into config_model.cost_tier)
+                               is the actual config-table-driven source of truth.
     """
 
     model_type: str

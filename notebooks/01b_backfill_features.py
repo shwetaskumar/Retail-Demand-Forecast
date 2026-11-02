@@ -24,7 +24,7 @@
 # COMMAND ----------
 
 # DBTITLE 1,Widgets
-dbutils.widgets.text("market_id", "US")
+dbutils.widgets.text("market_id", "CA")
 dbutils.widgets.text("env", "")
 dbutils.widgets.text("train_start_date", "2023-01-01")
 dbutils.widgets.text("end_date", "")
@@ -33,15 +33,6 @@ dbutils.widgets.text("step_days", "")
 # COMMAND ----------
 
 display(dbutils.widgets.getAll())
-
-# COMMAND ----------
-
-# DBTITLE 1,Install pinned deps (interactive runs only — job clusters already have these)
-# MAGIC %pip install -r ../requirements.txt
-
-# COMMAND ----------
-
-dbutils.library.restartPython()
 
 # COMMAND ----------
 
@@ -59,14 +50,13 @@ step_days        = int(_step_days_raw) if _step_days_raw else None
 import os
 import sys
 
-# Ask the runtime for THIS notebook's own workspace path, then go up one level
-# (out of notebooks/) to the repo root. Portable across workspaces/usernames and
-# regardless of whether this is deployed via `databricks bundle deploy` or linked
-# as a Databricks Git folder (Repos) backed by Azure DevOps/GitHub — no hardcoded
-# path. __file__ is not available inside a notebook cell, which is why this asks
-# the runtime instead.
-_notebook_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
-_REPO_ROOT = "/Workspace" + os.path.dirname(os.path.dirname(_notebook_path))
+# Databricks Free Edition serverless compute can stat/list Workspace Files but
+# cannot open() them for content (java.io.FileNotFoundException wrapped as
+# "Input/output error" from SharedUCWorkspaceLocalFileSystem — a Free Edition
+# environment limitation, confirmed empirically, not specific to this repo).
+# Shared modules are synced to a UC Volume instead of imported straight from
+# the bundle-deployed Workspace path.
+_REPO_ROOT = f"/Volumes/{env}/default/pylib"
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 

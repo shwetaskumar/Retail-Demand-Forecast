@@ -37,11 +37,10 @@ DECOMPOSITION CONTRACT (docs §10.1):
   "seasonal" signal is noise rather than pattern at daily grain.
 
 WHEN TO USE:
-  The model_type = "croston" row in config_model is enabled by default.
-  The layered engine's category routing (training/engine_layered.py) should
-  place Croston as the FIRST candidate for D and zero-heavy C series by setting
-  a low evaluation_cost — the stats layer already does this; Croston slips in
-  as an additional candidate at cost=0 (even faster than ETS).
+  The model_type = "croston" row in config_model is enabled by default. It runs
+  in the merged ETS-family tier (cost 3, alongside statsforecast/ets_event/
+  elastic_net) — see config/seed_defaults.py's _DEFAULT_MODEL_COST_TIERS for the
+  config-table-driven cascade order.
 
 PARAMETERS (stored in champion_index.params):
   alpha_z: float [0, 1] — smoothing for demand size (default 0.1)
@@ -92,7 +91,7 @@ class CrostonModel(ForecastModel):
     """
 
     model_type = "croston"
-    evaluation_cost = 0   # Faster than ETS: pure NumPy, no external library call.
+    evaluation_cost = 3   # merged ETS-family tier (config_model.cost_tier normally overrides this)
 
     def __init__(self) -> None:
         self._alpha_z: float = _DEFAULT_ALPHA

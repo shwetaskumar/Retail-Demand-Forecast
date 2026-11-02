@@ -15,6 +15,8 @@ Metrics produced per fold and averaged across folds:
                Supplementary diagnostic stored in backtest_metrics.
   naive_mae_7d — raw denominator; stored so downstream code can recompute MASE
                at different aggregation levels without re-running backtest.
+  baseline_wmape_7d — WMAPE of the trailing-28-day-mean baseline on the same folds;
+               the denominator of the relative "skill" gate (training/evaluation.py).
 """
 from __future__ import annotations
 
@@ -69,6 +71,27 @@ def rolling_origin_folds(
     return folds
 
 
+# Trailing window of the level baseline the relative gate is measured against: the mean
+# daily qty over the last 28 training days, held flat across the holdout. Deliberately a
+# strong naive benchmark (on Kaggle M5 it beats the lag-7 seasonal naive and several
+# per-series models outright), so "beats the baseline" is a meaningful bar.
+BASELINE_WINDOW_DAYS = 28
+
+
+def _nanmean_or_nan(values: list[float]) -> float:
+    finite = [v for v in values if v == v]
+    return float(np.mean(finite)) if finite else float("nan")
+
+
+def baseline_wmape(train_pdf: pd.DataFrame, holdout_pdf: pd.DataFrame) -> float:
+    """WMAPE of the trailing-BASELINE_WINDOW_DAYS-mean forecast on one fold's holdout."""
+    history = train_pdf["qty"].astype(float).tail(BASELINE_WINDOW_DAYS)
+    if history.empty:
+        return float("nan")
+    actual = holdout_pdf["qty"].astype(float).reset_index(drop=True)
+    return _wmape_fn(actual, pd.Series(np.full(len(actual), history.mean())))
+
+
 def backtest_metrics(
     model: ForecastModel,
     series_pdf: pd.DataFrame,
@@ -88,15 +111,19 @@ def backtest_metrics(
         mase_7d     — MAE / naive_mae averaged across folds (champion SELECTION key).
         bias_pct    — directional error averaged across folds (diagnostic).
         naive_mae_7d — lag-7 naïve MAE averaged across folds (MASE denominator).
+        baseline_wmape_7d — WMAPE of the trailing-28-day-mean baseline on the same folds
+                    (denominator of the relative "skill" gate, training/evaluation.py).
     All values are NaN when there are no usable folds.
     """
     folds = rolling_origin_folds(series_pdf, n_folds, val_weeks, eval_horizon_days)
     if not folds:
         nan = float("nan")
         return {"wmape_7d": nan, "mase_7d": nan, "bias_pct": nan, "naive_mae_7d": nan,
+                "baseline_wmape_7d": nan,
                 "osc_ratio": nan, "actual_ac7": nan}
 
     fold_wmape, fold_mase, fold_bias, fold_naive_mae = [], [], [], []
+    fold_baseline_wmape = [baseline_wmape(train_pdf, holdout_pdf) for train_pdf, holdout_pdf in folds]
     for train_pdf, holdout_pdf in folds:
         model.fit(train_pdf, holdout_pdf, params)
         predicted = model.predict(holdout_pdf).reset_index(drop=True)
@@ -129,6 +156,7 @@ def backtest_metrics(
         "mase_7d":      float(np.nanmean(fold_mase)),
         "bias_pct":     float(np.nanmean(fold_bias)),
         "naive_mae_7d": float(np.nanmean(fold_naive_mae)) if fold_naive_mae else float("nan"),
+        "baseline_wmape_7d": _nanmean_or_nan(fold_baseline_wmape),
     }
 
 

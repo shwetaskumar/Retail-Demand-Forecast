@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from training.backtest import backtest_model, rolling_origin_folds
+from training.backtest import BASELINE_WINDOW_DAYS, backtest_metrics, backtest_model, baseline_wmape, rolling_origin_folds
 from training.models.base import Decomposition, ForecastModel
 
 
@@ -118,3 +118,21 @@ class TestBacktestModel:
         model = _FakeForecastModel()
         backtest_model(model, _series_pdf(150), n_folds=5, val_weeks=10, eval_horizon_days=7, params={"bias": 2.0})
         assert model._bias == 2.0
+
+
+class TestBaselineWmape:
+    def test_flat_trailing_mean_forecast(self):
+        train = pd.DataFrame({"qty": [0.0] * 100 + [2.0] * BASELINE_WINDOW_DAYS})
+        holdout = pd.DataFrame({"qty": [4.0] * 7})
+        # baseline forecasts 2/day -> weekly 14 vs actual 28 -> 50%
+        assert baseline_wmape(train, holdout) == pytest.approx(0.5)
+
+    def test_zero_volume_holdout_is_nan(self):
+        train = pd.DataFrame({"qty": [1.0] * 40})
+        assert np.isnan(baseline_wmape(train, pd.DataFrame({"qty": [0.0] * 7})))
+
+    def test_backtest_metrics_reports_baseline(self):
+        metrics = backtest_metrics(_FakeForecastModel(), _series_pdf(120), 3, 6, 7, {})
+        assert "baseline_wmape_7d" in metrics
+        assert metrics["baseline_wmape_7d"] == metrics["baseline_wmape_7d"]  # finite, not NaN
+

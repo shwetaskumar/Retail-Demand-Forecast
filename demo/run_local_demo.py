@@ -1,17 +1,24 @@
 """
-demo/run_local_demo.py — no-Spark local demo.
+demo/run_local_demo.py — no-Spark local demo, run against the real Kaggle M5
+Forecasting Accuracy dataset (Walmart daily unit sales).
 
-Generates a synthetic multi-store x multi-sku dataset (data/synthetic/generator.py),
-fits real candidate models (Prophet/statsforecast/LightGBM/ElasticNet/Croston) via the
-same pandas-only functions the test suite exercises — training/engine.py::fit_one_series,
-training/champion.py::select_champions, training/evaluation.py::gate/wmape — and writes
-the README's accuracy table + example forecast charts to docs/assets/.
+Runs the production default candidate set (config/seed_defaults.py: the equal-weight
+auto_arima + ets_event + lgbm ensemble — see that file for why single models are off by
+default) through the pandas-only functions the test suite exercises —
+training/engine.py::fit_one_series, training/evaluation.py::gate — then scores the
+champions on a held-out week against the trailing-28-day-mean baseline, and writes the
+README's accuracy table + example forecast charts to docs/assets/.
+demo/compare_selection_rules.py is the companion experiment comparing champion-selection
+rules over several held-out weeks.
 
-Not part of the deployed pipeline (no Spark/Databricks here — this is exactly what
-CLAUDE.md's "authoring-only" environment supports). Re-run whenever the README's
-numbers need refreshing:
+Requires the M5 dataset downloaded locally first (see data/kaggle_m5/loader.py's
+module docstring for the Kaggle CLI steps — M5 is a competition, not a plain
+dataset, so this needs your own Kaggle account/credentials and cannot be fetched
+automatically):
 
     pip install -r requirements.txt
+    kaggle competitions download -c m5-forecasting-accuracy -p data/m5_raw
+    unzip data/m5_raw/m5-forecasting-accuracy.zip -d data/m5_raw
     python demo/run_local_demo.py
 """
 from __future__ import annotations
@@ -28,6 +35,7 @@ if _REPO_ROOT not in _sys.path:
 del _sys, _Path, _REPO_ROOT
 
 import json
+import math
 import time
 from pathlib import Path
 
@@ -38,27 +46,42 @@ import numpy as np
 import pandas as pd
 
 from config.loader import CategoryConfig, ForecastConfig, MarketConfig, ModelConfig
-from config.seed_defaults import DEFAULT_CATEGORY_THRESHOLDS
-from data.synthetic.generator import generate_synthetic_source
+from config.seed_defaults import DEFAULT_CATEGORY_SKILL_THRESHOLDS, DEFAULT_CATEGORY_THRESHOLDS
+from data.features.category_classification import classify_volume_band, resolve_category
+from data.kaggle_m5.loader import load_m5_source
+from training.backtest import rolling_origin_folds
 from training.engine import fit_one_series
 from training.evaluation import gate
 from training.models.registry import build as build_model
 
-_SEED = 42
-_N_STORES = 12
-_N_SKUS = 40
-_N_DAYS = 730
-_HORIZON_DAYS = 14
-_MAX_SERIES = 40
-_CANDIDATE_MODELS = ["prophet", "statsforecast", "lgbm", "elastic_net", "croston"]
+_M5_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "m5_raw"
+_STATES = ["CA"]          # M5 state_id -> our market_id; CA alone keeps the local run fast
+_MAX_SKUS = 300           # sampled before the (expensive) wide->long melt — see loader docstring
+_TRAILING_DAYS = 730      # ~2 years of history, most recent
+_NEW_ITEM_MAX_DAYS = 365  # data/features/lifecycle.py's is_new_item threshold, mirrored here
+# Held-out evaluation week (docs/instructions.md §9: "evaluate champions on the next 7
+# days"). Champions are selected by fit_one_series on history that EXCLUDES this week, then
+# scored on it — so the README's headline numbers are out-of-sample, not the in-sample
+# backtest score of a best-of-N pick (which flatters per-series selection; see run_demo).
+_HOLDOUT_DAYS = 7
+_BASELINE_DAYS = 28  # training/backtest.py::BASELINE_WINDOW_DAYS — the gate's yardstick
+_CHART_MIN_WEEKLY_UNITS = 7  # charts skip near-zero series (nothing visible to plot)
+# 150 series: enough that the category numbers stop swinging with which handful of series
+# the sampler drew (a 40-series sample once reported 24.6% overall WMAPE; 150 puts it ~40%).
+_MAX_SERIES = 150
+# Mirrors the production default config: config/seed_defaults.py's cost tiers minus
+# _DEFAULT_DISABLED_MODELS.
+_CANDIDATE_MODELS = ["ensemble"]
 _OUT_DIR = Path(__file__).resolve().parent.parent / "docs" / "assets"
 
 
-def _build_config() -> ForecastConfig:
+def _build_config(markets: list[str]) -> ForecastConfig:
     """A minimal ForecastConfig for the demo — same dataclasses config/loader.py
-    returns in production, just built inline instead of read from Delta."""
+    returns in production, just built inline instead of read from Delta. One
+    CategoryConfig per (market, category) combo, same thresholds for every market
+    (a real multi-market deployment would seed per-market thresholds via the app)."""
     market_config = MarketConfig(
-        market_id="US",
+        market_id=markets[0],
         active=True,
         horizon_days=140,
         eval_horizon_days=7,
@@ -77,17 +100,39 @@ def _build_config() -> ForecastConfig:
     )
     categories = [
         CategoryConfig(
-            market_id="US", category=cat, accuracy_threshold=thresh,
+            market_id=market_id, category=cat, accuracy_threshold=thresh,
             gate_grains=["category_cohort", "market_sku", "market_store_sku"],
             series_grain="market_store_sku", drift_tolerance=0.05,
+            min_skill_vs_baseline=DEFAULT_CATEGORY_SKILL_THRESHOLDS.get(cat),
         )
+        for market_id in markets
         for cat, thresh in DEFAULT_CATEGORY_THRESHOLDS.items()
     ]
     models = [
-        ModelConfig(market_id="US", model_type=mt, enabled=True, param_space={})
+        ModelConfig(market_id=markets[0], model_type=mt, enabled=True, param_space={})
         for mt in _CANDIDATE_MODELS
     ]
     return ForecastConfig(market_config=market_config, categories=categories, models=models, features=[])
+
+
+def _classify_categories(sales_df: pd.DataFrame) -> dict[str, str]:
+    """Market-wide {sku_id: category} using the SAME rule data/features/
+    category_classification.py applies in production (ported to pandas here since
+    that module's compute_sku_category is Spark SQL) — M5 ships no category column;
+    category is a volume-derived classification either way, real or synthetic data."""
+    by_sku = sales_df.groupby("sku_id")["qty"].sum().rename("total_qty").reset_index()
+    by_sku = by_sku.sort_values(["total_qty", "sku_id"], ascending=[False, True])
+    by_sku["cum_share"] = by_sku["total_qty"].cumsum() / by_sku["total_qty"].sum()
+
+    n_days_present = sales_df[sales_df["qty"] > 0].groupby("sku_id")["date_id"].nunique()
+
+    categories = {}
+    for _, row in by_sku.iterrows():
+        sku_id = row["sku_id"]
+        volume_band = classify_volume_band(row["total_qty"], row["cum_share"])
+        is_new_item = n_days_present.get(sku_id, 0) < _NEW_ITEM_MAX_DAYS
+        categories[sku_id] = resolve_category(is_new_item, volume_band)
+    return categories
 
 
 def _calendar_with_event_flags(cal_df: pd.DataFrame, events_df: pd.DataFrame) -> pd.DataFrame:
@@ -133,17 +178,21 @@ def _build_series_frames(frames: dict[str, pd.DataFrame]) -> dict[tuple[str, str
     training/engine.py::fit_one_series (series_key/market_id/category/store_id/
     sku_id/date_id/qty/isActive + the calendar/event feature columns)."""
     cal_flags = _calendar_with_event_flags(frames["calendar_date"], frames["events"])
-    sku_cat = dict(zip(frames["sku"]["sku_id"], frames["sku"]["category"]))
 
     sales_df = frames["sales"].copy()
     sales_df["date_id"] = pd.to_datetime(sales_df["date_id"])
     sales_df["qty"] = sales_df["units_sold"] + sales_df["units_promotional"] + sales_df["units_shrinkage"]
+
+    sku_cat = _classify_categories(sales_df)
 
     merged = sales_df.merge(cal_flags, on=["market_id", "date_id"], how="left")
     merged["category"] = merged["sku_id"].map(sku_cat).fillna("D")
     merged["series_key"] = (
         merged["market_id"] + "|" + merged["category"] + "|" + merged["store_id"] + "|" + merged["sku_id"]
     )
+    # M5's sku_store active window (data/kaggle_m5/loader.py, from sell_prices.csv listing
+    # weeks) tells us the true active range; treat every row inside it as active — this
+    # demo skips is_new_store/is_delisted nuance the real pipeline's lifecycle.py handles.
     merged["isActive"] = 1
 
     keep_cols = [
@@ -157,25 +206,27 @@ def _build_series_frames(frames: dict[str, pd.DataFrame]) -> dict[tuple[str, str
     }
 
 
-def _plot_series(series_key: str, series_pdf: pd.DataFrame, model_type: str, out_path: Path) -> None:
-    """Actual-vs-forecast + additive decomposition stack for one series' holdout window —
-    refits the champion model type on a plain train/holdout split (same pattern as
-    tests/test_models.py) purely to get a decompose() to plot; the champion SELECTION
-    above already ran the real backtest via fit_one_series."""
-    train = series_pdf.iloc[: -_HORIZON_DAYS]
-    horizon = series_pdf.iloc[-_HORIZON_DAYS:]
-
+def _holdout_forecast(model_type: str, train: pd.DataFrame, horizon: pd.DataFrame):
+    """Refit `model_type` on `train` (the same history champion selection saw) and return
+    (yhat, decomposition) for the held-out `horizon`."""
     model = build_model(model_type)
     model.fit(train, horizon, params={})
     decomp = model.decompose(horizon)
+    return np.asarray(decomp.yhat, dtype=float), decomp
+
+
+def _plot_series(series_key: str, series_pdf: pd.DataFrame, model_type: str, decomp, wmape_value: float,
+                 out_path: Path) -> None:
+    """Actual-vs-forecast + additive decomposition stack for one series' held-out week."""
+    horizon = series_pdf.iloc[-_HOLDOUT_DAYS:]
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 7), height_ratios=[1.3, 1])
 
-    tail = series_pdf.iloc[-(_HORIZON_DAYS + 45):]
+    tail = series_pdf.iloc[-(_HOLDOUT_DAYS + 45):]
     ax1.plot(tail["date_id"], tail["qty"], label="actual", color="#333333", linewidth=1.5)
     ax1.plot(horizon["date_id"], decomp.yhat, label="forecast", color="#1f77b4", linewidth=2, linestyle="--")
     ax1.axvline(horizon["date_id"].iloc[0], color="#999999", linestyle=":", linewidth=1)
-    ax1.set_title(f"{series_key} — {model_type} (actual vs. forecast)")
+    ax1.set_title(f"{series_key} — {model_type}, held-out week WMAPE {wmape_value:.0%}")
     ax1.legend(loc="upper left")
     ax1.set_ylabel("qty")
 
@@ -200,7 +251,7 @@ def _plot_series(series_key: str, series_pdf: pd.DataFrame, model_type: str, out
     # matplotlib's stackplot (not pandas' .plot.area) — tolerates components that go
     # negative (e.g. seasonality_yearly, a holiday dip), which a real decomposition can.
     ax2.stackplot(comp_df.index, *[comp_df[c] for c in comp_df.columns], labels=comp_df.columns, alpha=0.85)
-    ax2.set_title("additive decomposition (holdout window)")
+    ax2.set_title("additive decomposition (held-out week)")
     ax2.legend(loc="upper left", fontsize=7, ncol=2)
     ax2.set_ylabel("contribution")
 
@@ -209,92 +260,171 @@ def _plot_series(series_key: str, series_pdf: pd.DataFrame, model_type: str, out
     plt.close(fig)
 
 
+def _poisson_mean_abs_dev(lam: float) -> float:
+    """E|X - lam| for X ~ Poisson(lam): the error even a perfect forecast of the mean makes."""
+    if lam <= 0:
+        return 0.0
+    k = np.arange(0, int(lam * 4 + 50))
+    log_pmf = k * math.log(lam) - lam - np.array([math.lgamma(x + 1) for x in k])
+    return float((np.abs(k - lam) * np.exp(log_pmf)).sum())
+
+
+def _noise_floor(series_frames: dict, keys: list, config: ForecastConfig) -> dict[str, float]:
+    """Per-category irreducible weekly WMAPE if weekly demand were Poisson around each
+    series' mean weekly volume on the backtest folds — a lower bound no model can beat,
+    used to put the gate's numbers in context (not to gate anything)."""
+    mc = config.market_config
+    err: dict[str, float] = {}
+    vol: dict[str, float] = {}
+    for key in keys:
+        pdf = series_frames[key].assign(date_id=lambda d: pd.to_datetime(d["date_id"]))
+        weekly = [h["qty"].sum() for _, h in rolling_origin_folds(pdf, mc.backtest_folds, mc.val_weeks, mc.eval_horizon_days)]
+        if not weekly:
+            continue
+        cat, lam = pdf["category"].iloc[0], float(np.mean(weekly))
+        err[cat] = err.get(cat, 0.0) + _poisson_mean_abs_dev(lam) * len(weekly)
+        vol[cat] = vol.get(cat, 0.0) + float(np.sum(weekly))
+    floors = {c: err[c] / vol[c] for c in err if vol[c] > 0}
+    if vol:
+        floors["ALL"] = sum(err.values()) / sum(vol.values())
+    return floors
+
+
+def _pooled_wmape(actual: pd.Series, forecast: pd.Series) -> float | None:
+    """sum|A - F| / sum A over weekly totals — training/evaluation.py::wmape pooled across series."""
+    total = float(actual.sum())
+    return float((actual - forecast).abs().sum() / total) if total > 0 else None
+
+
+def _skill(model_wmape: float | None, baseline_wmape: float | None) -> float | None:
+    if model_wmape is None or not baseline_wmape:
+        return None
+    return 1.0 - model_wmape / baseline_wmape
+
+
 def run_demo() -> dict:
     t0 = time.time()
     _OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    frames = generate_synthetic_source(
-        seed=_SEED, n_stores=_N_STORES, n_skus=_N_SKUS, n_days=_N_DAYS, markets=["US"]
+    frames = load_m5_source(
+        _M5_DATA_DIR, states=_STATES, max_skus=_MAX_SKUS, trailing_days=_TRAILING_DAYS,
     )
+    markets = sorted(frames["store"]["market_id"].unique().tolist())
     series_frames = _build_series_frames(frames)
-    config = _build_config()
-    snapshot_date = str(frames["calendar_date"]["date_id"].max())
+    config = _build_config(markets)
 
     all_keys = list(series_frames.keys())
-    rng = np.random.default_rng(_SEED)
+    rng = np.random.default_rng(42)
     sample_idx = rng.choice(len(all_keys), size=min(_MAX_SERIES, len(all_keys)), replace=False)
     sample_keys = [all_keys[i] for i in sample_idx]
 
     fit_t0 = time.time()
-    result_rows = []
+    result_rows, holdout_rows, decomps = [], [], {}
     for store_id, sku_id in sample_keys:
         series_pdf = series_frames[(store_id, sku_id)]
-        if len(series_pdf) < config.market_config.eval_horizon_days * 4:
+        if len(series_pdf) < config.market_config.eval_horizon_days * 4 + _HOLDOUT_DAYS:
             continue
-        result = fit_one_series(series_pdf, config, snapshot_date)
-        row = result.iloc[0].to_dict()
-        if row["status"] in ("ok", "stable"):
-            result_rows.append(row)
+        train, held = series_pdf.iloc[:-_HOLDOUT_DAYS], series_pdf.iloc[-_HOLDOUT_DAYS:]
+        snapshot_date = str(pd.Timestamp(train["date_id"].iloc[-1]).date())
+        row = fit_one_series(train, config, snapshot_date).iloc[0].to_dict()
+        if row["status"] not in ("ok", "stable"):
+            continue
+        result_rows.append(row)
+
+        # Out-of-sample: champion vs. the 28-day-mean baseline, both forecasting the same
+        # unseen week from the same history.
+        champ_yhat, champ_decomp = _holdout_forecast(row["model_type"], train, held)
+        decomps[row["series_key"]] = champ_decomp
+        holdout_rows.append({
+            "series_key": row["series_key"], "category": row["category"],
+            "store_id": store_id, "sku_id": sku_id, "model_type": row["model_type"],
+            "actual": float(held["qty"].sum()),
+            "champion": float(champ_yhat.sum()),
+            "baseline": float(train["qty"].tail(_BASELINE_DAYS).mean() * _HOLDOUT_DAYS),
+        })
     fit_elapsed = time.time() - fit_t0
 
+    # ── Backtest gate (what the production pipeline gates and tunes on) ──────────────
     champions_pdf = pd.DataFrame(result_rows)
     gated = gate(champions_pdf, config.categories)
-    series_gate = gated[gated["grain"] == "market_store_sku"].copy()
-
-    category_summary = (
-        gated[gated["grain"] == "category_cohort"][["entity_key", "wmape", "threshold", "passed", "volume"]]
+    gate_summary = (
+        gated[gated["grain"] == "category_cohort"][
+            ["market_id", "entity_key", "wmape", "baseline_wmape", "skill", "min_skill", "passed"]
+        ]
         .rename(columns={"entity_key": "category"})
-        .sort_values("category")
+        .sort_values(["market_id", "category"])
         .to_dict("records")
     )
+    grain_pass_rate = {
+        grain: float(g["passed"].dropna().astype(bool).mean()) if g["passed"].notna().any() else None
+        for grain, g in gated.groupby("grain")
+    }
 
-    # Representative series for the README's example charts: lowest-WMAPE series for up
-    # to 3 distinct champion model types (favors a diverse showcase over 3 near-identical
-    # picks, which is what plain best/median/worst tends to produce when one cheap model
-    # dominates the low-volume tail).
-    result_by_key = {r["series_key"]: r for r in result_rows}
-    ranked = series_gate.sort_values("wmape").reset_index(drop=True)
-    picks, seen_models, seen_keys = [], set(), set()
+    # ── Held-out week (the README's headline accuracy) ───────────────────────────────
+    hold = pd.DataFrame(holdout_rows)
+    noise_floor = _noise_floor(series_frames, [(r["store_id"], r["sku_id"]) for r in holdout_rows], config)
+
+    def _summary(g: pd.DataFrame, floor: float | None) -> dict:
+        champ, base = (_pooled_wmape(g["actual"], g[c]) for c in ("champion", "baseline"))
+        return {
+            "n_series": int(len(g)),
+            "median_weekly_units": float(g["actual"].median()),
+            "champion_wmape": champ, "baseline_wmape": base,
+            "champion_skill": _skill(champ, base),
+            "noise_floor_wmape": floor,
+        }
+
+    holdout_by_category = {
+        cat: _summary(g, noise_floor.get(cat)) for cat, g in hold.groupby("category")
+    }
+    holdout_overall = _summary(hold, noise_floor.get("ALL"))
+
+    # Example charts: TYPICAL series, not the best ones — the 3 series closest to the median
+    # held-out champion WMAPE (one per distinct champion model and category), among series
+    # selling at least _CHART_MIN_WEEKLY_UNITS units that week (a near-zero series has
+    # nothing to see).
+    hold["champion_wmape"] = (hold["actual"] - hold["champion"]).abs() / hold["actual"].where(hold["actual"] > 0)
+    chartable = hold[hold["actual"] >= _CHART_MIN_WEEKLY_UNITS].dropna(subset=["champion_wmape"])
+    median_wmape = float(chartable["champion_wmape"].median()) if len(chartable) else float("nan")
+    ranked = chartable.assign(_dist=(chartable["champion_wmape"] - median_wmape).abs()).sort_values("_dist")
+    picks, seen = [], set()
     for _, row in ranked.iterrows():
-        model_type = result_by_key[row["entity_key"]]["model_type"]
-        if model_type in seen_models:
+        tag = (row["model_type"], row["category"])
+        if tag in seen:
             continue
-        seen_models.add(model_type)
-        seen_keys.add(row["entity_key"])
+        seen.add(tag)
         picks.append(row)
         if len(picks) == 3:
             break
-    for _, row in ranked.iterrows():
-        if len(picks) == 3:
-            break
-        if row["entity_key"] not in seen_keys:
-            seen_keys.add(row["entity_key"])
-            picks.append(row)
 
     chart_files = []
     for i, pick in enumerate(picks):
-        champ_row = result_by_key[pick["entity_key"]]
-        store_id, sku_id = champ_row["store_id"], champ_row["sku_id"]
-        model_type = champ_row["model_type"]
-        out_path = _OUT_DIR / f"forecast_{i}_{sku_id}_{store_id}.png"
-        _plot_series(champ_row["series_key"], series_frames[(store_id, sku_id)], model_type, out_path)
+        out_path = _OUT_DIR / f"forecast_{i}_{pick['sku_id']}_{pick['store_id']}.png"
+        _plot_series(pick["series_key"], series_frames[(pick["store_id"], pick["sku_id"])], pick["model_type"],
+                     decomps[pick["series_key"]], float(pick["champion_wmape"]), out_path)
         chart_files.append({
             "file": out_path.name,
-            "series_key": champ_row["series_key"],
-            "model_type": model_type,
-            "wmape_7d": float(champ_row["wmape_7d"]),
+            "series_key": pick["series_key"],
+            "model_type": pick["model_type"],
+            "holdout_wmape": float(pick["champion_wmape"]),
+            "holdout_weekly_units": float(pick["actual"]),
         })
 
     total_elapsed = time.time() - t0
     metrics = {
-        "seed": _SEED,
-        "n_stores": _N_STORES,
-        "n_skus": _N_SKUS,
+        "dataset": "Kaggle M5 Forecasting Accuracy (Walmart)",
+        "states": _STATES,
+        "max_skus": _MAX_SKUS,
+        "trailing_days": _TRAILING_DAYS,
         "n_series_sampled": len(sample_keys),
-        "n_series_evaluated": len(result_rows),
+        "n_series_evaluated": len(holdout_rows),
         "candidate_models": _CANDIDATE_MODELS,
-        "overall_wmape_7d": float(np.average(series_gate["wmape"], weights=series_gate["volume"])) if len(series_gate) else None,
-        "category_summary": category_summary,
+        "metric": "7-day weekly-total WMAPE, pooled: sum|A-F| / sum A over series",
+        "holdout_overall": holdout_overall,
+        "holdout_by_category": holdout_by_category,
+        "backtest_gate_by_category": gate_summary,
+        "backtest_gate_pass_rate_by_grain": grain_pass_rate,
+        "champion_model_counts": champions_pdf["model_type"].value_counts().to_dict(),
         "charts": chart_files,
         "timing": {
             "fit_and_select_seconds": round(fit_elapsed, 2),

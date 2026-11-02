@@ -1,5 +1,5 @@
 """
-utils/spark.py — Spark session helpers (docs/instructions.md §18, CLAUDE.md EXECUTION rule).
+utils/spark.py — Spark session helpers (docs/instructions.md §18).
 
 A SparkSession is never created at import time. Every job entrypoint obtains
 (or is given) a session and injects it into pure transform functions, so every

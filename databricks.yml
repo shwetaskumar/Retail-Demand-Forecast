@@ -23,9 +23,18 @@ bundle:
 variables:
   market_id:
     description: >-
-      Market code, e.g. US. Onboarding a new market is a config-table INSERT
-      (config table, via the Databricks App) and re-running these jobs with a
-      different market_id value — never a new target, file, or code change.
+      Market code, e.g. CA (this project's demo data is Kaggle's M5 dataset,
+      where state_id CA/TX/WI becomes market_id — see notebooks/00b_ingest_m5.py).
+      Onboarding a new market is a config-table INSERT (config table, via the
+      Databricks App) and re-running these jobs with a different market_id
+      value — never a new target, file, or code change.
+    default: ""
+  m5_volume_path:
+    description: >-
+      Unity Catalog Volume path holding the raw M5 CSVs (calendar.csv,
+      sales_train_evaluation.csv, sell_prices.csv) — see notebooks/00b_ingest_m5.py's
+      header cell for the one-time Kaggle download + upload steps. Only used by
+      the ingest_m5_job; e.g. "/Volumes/<catalog>/source/m5_raw".
     default: ""
   snapshot_date:
     description: >-
@@ -42,12 +51,12 @@ variables:
   run_hpt:
     description: >-
       "True"/"False" — conditional Optuna HPT for series/cohorts that failed
-      the gate (docs/instructions.md §12: never automatic, explicit remediation
-      only). Surfaced as a dropdown widget in notebooks/02_train.py; the
-      scheduled run leaves this "False" — flip it via "Run now with different
-      parameters" in the Databricks UI, not by editing this file, for a one-off
-      remediation run.
-    default: "False"
+      the gate (docs/instructions.md §12). Still only touches series that actually
+      missed the gate — never a full retrain — but this project runs it on the
+      regular schedule (default "True") rather than gating it behind a manual
+      "Run now with different parameters" trigger. Surfaced as a dropdown widget
+      in notebooks/02_train.py; override per-run from the Databricks UI if needed.
+    default: "True"
   use_batch_engine:
     description: >-
       "True"/"False" — cold-start mode (run_engine_batch: ETS+Ridge per
@@ -201,32 +210,36 @@ resources:
       # No schedule — backfill is on-demand only
 
     # ===================================================================================
-    # JOB 0b: GENERATE SYNTHETIC SOURCE — on-demand, unscheduled. Stands in for a real
-    # POS/ERP source feed on a fresh Free Edition workspace (notebooks/00b_generate_synthetic_source.py).
-    # Not part of the daily/weekly cadence — run once before the first JOB 1 run, or
-    # any time you want to regenerate the demo dataset with a different scale/seed.
+    # JOB 0b: INGEST M5 — on-demand, unscheduled. Loads the Kaggle M5 Forecasting
+    # Accuracy dataset (real Walmart sales — see notebooks/00b_ingest_m5.py's header
+    # cell for the one-time Kaggle download + Volume upload steps) as this project's
+    # source data on a fresh Free Edition workspace. Not part of the daily/weekly
+    # cadence — run once before the first JOB 1 run, or again with different
+    # states/max_skus/trailing_days.
     # ===================================================================================
-    generate_synthetic_source_job:
-      name: "retail-forecast-generate-synthetic-source"
+    ingest_m5_job:
+      name: "retail-forecast-ingest-m5"
       max_concurrent_runs: 1
       queue:
         enabled: true
       tags:
         project: retail-demand-forecast
-        job: generate-synthetic-source
-        market_id: "${var.market_id}"
+        job: ingest-m5
         catalog: "${var.catalog}"
       tasks:
-        - task_key: generate_synthetic_source
+        - task_key: ingest_m5
           notebook_task:
-            notebook_path: notebooks/00b_generate_synthetic_source.py
+            notebook_path: notebooks/00b_ingest_m5.py
             base_parameters:
               env: "${var.catalog}"
-              market_id: "${var.market_id}"
+              volume_path: "${var.m5_volume_path}"
+              states: "CA"
+              max_skus: "300"
+              trailing_days: "730"
       email_notifications:
         on_failure:
           - "${var.oncall_email}"
-      timeout_seconds: 1800
+      timeout_seconds: 3600
       # No schedule — on-demand only
 
     # ===================================================================================
@@ -377,6 +390,22 @@ targets:
       # nothing to select between.
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
     variables:
-      catalog: ""   # TODO: set to your Free Edition workspace's catalog name
-      oncall_email: ""   # TODO: set to your own email
+      catalog: "workspace"
+      oncall_email: "you@example.com"  # set your own; override with --var oncall_email=...
+      # Default demo market for this Free Edition deploy (Kaggle M5's CA state_id
+      # — see notebooks/00b_ingest_m5.py). `jobs run-now --json '{"notebook_params":
+      # ...}'` does NOT reliably override a notebook_task's already-templated
+      # base_parameters on this workspace (confirmed empirically: produced a
+      # market_id="" no-op run) — override via `databricks bundle run <job> --var`
+      # or the Databricks UI's "Run now with different parameters" instead.
+      market_id: "CA"
+      # M5 is a static historical dataset (sales_train_evaluation.csv covers
+      # 2014-05-24 through 2016-05-22 — verified from the ingested data, not the
+      # competition docs) with no new data ever arriving, unlike a real
+      # production source. Defaulting snapshot_date to current_date() (this
+      # architecture's normal default — see utils/dates.py::resolve_snapshot_date)
+      # would place every read/write window a decade past the data's actual
+      # range, silently producing zero rows everywhere (confirmed empirically).
+      # The dataset's last available date is the only sensible default here.
+      snapshot_date: "2016-05-22"
     # No `run_as` — Free Edition is single-user, jobs run as whoever deploys the bundle.

@@ -2,15 +2,17 @@
 **Project:** Retail Demand Forecast — bottom-up store×sku daily forecasting on Databricks
 **Owner:** Personal portfolio project (built solo)
 **Status:** Build-ready specification (instructions.md). This document makes the decisions; it is meant to be executed by an engineer or coding agent with minimal further refinement.
-**Primary market:** US (demo). **Design constraint:** market-agnostic — every market is onboarded by parameter/filter only.
+**Primary market:** CA (demo — Kaggle M5's state_id CA/TX/WI become market_id; see `data/kaggle_m5/loader.py`). **Design constraint:** market-agnostic — every market is onboarded by parameter/filter only.
 
 > How to read this document. Sections 1–6 are the BRD (why, what, who, success). Sections 7–24 are the build spec (architecture, contracts, code structure, acceptance criteria). Anything marked **[ASSUMPTION]** is a default I have chosen so the build is not blocked — change it in `config/` if wrong. Anything marked **[OPEN]** is a question that does not block v1 but should be answered before prod scale-out.
 
-> **[AMENDMENT, post-v1]** §7's diagram and §13 describe each job's deployed entrypoint as a raw `spark_python_task` running `run_build_features.py` / `run_training.py` / `run_inference.py` directly with argparse CLI params. That's superseded — **CLAUDE.md lock #12 is now authoritative**: every job (all of JOB 1/2/3, the on-demand backfill job, and the evaluate/HPT-retune/final-rescore chain appended to JOB 3) is a `notebook_task` (`notebooks/NN_*.py`, `dbutils.widgets`, UI-driven). The per-job `run_*.py` wrapper modules this document describes (`data/run_build_features.py`, `training/run_training.py`, `inference/run_inference.py`, `training/run_evaluate.py`, `training/run_hpt_retune.py`, `inference/run_infer_final.py`, `data/run_full_backfill.py`) no longer exist — their orchestration logic was moved directly into the corresponding notebook as separate, individually re-runnable cells (one per pipeline step), so a failure is traceable to the exact step in the Databricks UI rather than hidden behind one wrapper `main()`. Only genuinely shared/tested logic stays in an importable module (`data/features/*.py`, `training/engine_layered.py`, `training/champion.py`, `training/evaluation.py`, `training/hpt.py`, `training/mlflow_registry.py`, `training/models/*.py`, `inference/batch_infer.py`, `inference/future_spine.py`, `inference/dq.py`). The internal pipeline steps, table contracts, and acceptance criteria below are otherwise unchanged. Where this document's text says "run `X.py`", read that as "the notebook that now contains `X.py`'s former pipeline steps as cells."
+> **[AMENDMENT, post-v1]** §7's diagram and §13 describe each job's deployed entrypoint as a raw `spark_python_task` running `run_build_features.py` / `run_training.py` / `run_inference.py` directly with argparse CLI params. That's superseded — **the notebook-per-job design is now authoritative**: every job (all of JOB 1/2/3, the on-demand backfill job, and the evaluate/HPT-retune/final-rescore chain appended to JOB 3) is a `notebook_task` (`notebooks/NN_*.py`, `dbutils.widgets`, UI-driven). The per-job `run_*.py` wrapper modules this document describes (`data/run_build_features.py`, `training/run_training.py`, `inference/run_inference.py`, `training/run_evaluate.py`, `training/run_hpt_retune.py`, `inference/run_infer_final.py`, `data/run_full_backfill.py`) no longer exist — their orchestration logic was moved directly into the corresponding notebook as separate, individually re-runnable cells (one per pipeline step), so a failure is traceable to the exact step in the Databricks UI rather than hidden behind one wrapper `main()`. Only genuinely shared/tested logic stays in an importable module (`data/features/*.py`, `training/engine_layered.py`, `training/champion.py`, `training/evaluation.py`, `training/hpt.py`, `training/mlflow_registry.py`, `training/models/*.py`, `inference/batch_infer.py`, `inference/future_spine.py`, `inference/dq.py`). The internal pipeline steps, table contracts, and acceptance criteria below are otherwise unchanged. Where this document's text says "run `X.py`", read that as "the notebook that now contains `X.py`'s former pipeline steps as cells."
 >
-> **[AMENDMENT 2, post-v1]** §6.3/§20 describe config as four typed tables. Superseded — **CLAUDE.md lock #6 is now authoritative**: config lives in one general-purpose EAV table, `control.forecast_config` (config/ddl/config_tables.sql), read by the same `config/loader.py::load_config` and pivoted into the identical typed dataclasses this document's contracts assume. No downstream contract changed, only the storage shape.
+> **[AMENDMENT 2, post-v1]** §6.3/§20 describe config as four typed tables. Superseded — **a single EAV config table is now authoritative**: config lives in one general-purpose EAV table, `control.forecast_config` (config/ddl/config_tables.sql), read by the same `config/loader.py::load_config` and pivoted into the identical typed dataclasses this document's contracts assume. No downstream contract changed, only the storage shape.
 >
 > **[AMENDMENT 3, post-v1]** The original design included three post-model adjustment notebooks (item-proxy backfill, store-proxy backfill, level-adaptation error-ratio correction) between inference and publish. Those are **removed** from this build to keep the project focused on the core modeling engine — see §7 and §14. The post-model chain is now just `infer_final → temp_closure → outbound`.
+>
+> **[AMENDMENT 4, post-v1]** The WMAPE gate (§3, §21) is now **relative by default**: a grain passes when its 7-day volume-weighted WMAPE beats a trailing-28-day-mean baseline's WMAPE on the same backtest folds by at least `min_skill_vs_baseline` (config param `category_skill_thresholds`, seeded at 3% for A/B/C/SEASONAL and 0% for D). The fixed per-category `accuracy_threshold` values stay in config as informational targets and remain the gate for any category without a skill threshold. Reason: at `market×store×sku` daily grain on sparse retail data, Poisson sampling noise alone exceeds the fixed targets for a typical series (median category-A series on the M5 demo sells ~13 units/week → ~18% irreducible weekly WMAPE vs the 15% an 85% target allows), so the absolute gate measured the data rather than the model. The relative gate is applied identically by the reported gate (`training/evaluation.py`), the cascade early-stop (`training/engine.py`, `training/engine_layered.py`), champion selection (`training/champion.py`) and daily breach detection (`notebooks/04_evaluate.py`); new columns are added by `config/ddl/migrate_v3_skill_gate.sql`. The same change adds an equal-weight `ensemble` candidate (`training/models/ensemble.py`, auto_arima + ets_event + lgbm, decomposition averaged per component so the §10.1 additive contract still holds exactly) and makes it the **only default candidate**: `demo/compare_selection_rules.py` (750 out-of-sample series-weeks on M5) showed that picking the backtest winner per series made forecasts worse than the 28-day-mean baseline (−7.1% skill, 90% CI −13.7%..0.0%), while always using the ensemble did not (+1.4%, CI −3.2%..+6.2%). Per-series champion selection (§10.2's cascade, champion_index, HPT) is unchanged and is re-enabled by enabling single models in config.
 
 ---
 
@@ -306,11 +308,9 @@ Clean, functional top-level folders — each stage of the pipeline is immediatel
 
 ```
 repo/
-  CLAUDE.md                    # anchor: architecture locks + authoring-only rule (not published)
   README.md
   requirements.txt             # mainstream libs only (no accelerator package)
   databricks.yml               # DABs: 3 jobs (data/training/inference), single Free Edition target
-  BUILD_PROMPTS.md             # private working notes (not published)
 
   config/                      # CONFIG = Delta tables + loader (NOT yaml per market)
     ddl/config_tables.sql      # config table DDL
@@ -331,8 +331,8 @@ repo/
       sales_base.py active_window.py lifecycle.py gap_fill.py
       stat_features.py temporal_features.py event_features.py writer.py
       halo_cannibalization_features.py category_classification.py category_features.py
-    synthetic/                 # synthetic source-data generator (stands in for real POS/ERP feeds)
-      generator.py
+    kaggle_m5/                  # Kaggle M5 dataset loader (real Walmart sales, stands in for a POS/ERP feed)
+      loader.py
 
   training/                    # ===== JOB 2: TRAINING =====
     engine.py                  # shared building blocks + pandas-only reference cascade (test-only)
@@ -359,9 +359,9 @@ repo/
     run_local_demo.py
 
   notebooks/                   # the deployed job entrypoints AND the pipeline logic itself
-                                # (CLAUDE.md lock #12) — one cell per pipeline step, calling
+                                # — one cell per pipeline step, calling
                                 # into the shared modules above; no per-job wrapper .py file
-    00_create_tables  00b_generate_synthetic_source
+    00_create_tables  00b_ingest_m5
     01_build_features  01b_backfill_features  02_train  03_score
     04_evaluate  05_hpt_retune  06_infer_final  07_full_backfill
     08_temp_closure  09_outbound

@@ -31,8 +31,8 @@ DECOMPOSITION CONTRACT (§10.1):
 
   Reconstruction check: trend + Σ event_lifts = yhat  (exact by construction).
 
-evaluation_cost = 1: statsforecast AutoARIMA is batch-capable via the same
-StatsForecast(...).fit() API as AutoETS.
+evaluation_cost = 2: runs after lgbm/croston/elastic_net in the cascade
+(training/engine_layered.py), before the ETS-family and Prophet tiers.
 """
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ class AutoARIMAModel(ForecastModel):
     """AutoARIMA baseline + Ridge event regression (two-stage, same pattern as ETSEventModel)."""
 
     model_type      = "auto_arima"
-    evaluation_cost = 1  # statsforecast AutoARIMA: batch-capable, same cost tier as ets_event
+    evaluation_cost = 2  # runs after lgbm/croston/elastic_net, before ets_event/statsforecast
 
     def __init__(self, season_length: int = _DEFAULT_SEASON_LENGTH) -> None:
         self.season_length          = season_length

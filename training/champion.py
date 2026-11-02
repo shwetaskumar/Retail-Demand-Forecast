@@ -77,6 +77,8 @@ _INDEX_COLUMNS = [
     "mase_7d",
     # WMAPE retained as the planner-facing gate metric (lag-1/lag-2 contract).
     "wmape_7d", "bias_pct", "naive_mae_7d",
+    # Trailing-28-day-mean baseline WMAPE (relative gate yardstick, training/evaluation.py).
+    "baseline_wmape_7d",
     # Volume (sum of weekly actuals in backtest holdout) — needed for
     # volume-weighted WMAPE aggregation across series.
     "volume",
@@ -96,6 +98,17 @@ def _gate_wmape_by_category(categories: "list[CategoryConfig] | None") -> dict[t
         (c.market_id, c.category): (1.0 - c.accuracy_threshold)
         for c in categories
         if c.accuracy_threshold
+    }
+
+
+def _min_skill_by_category(categories: "list[CategoryConfig] | None") -> dict[tuple, float]:
+    """(market_id, category) -> min_skill_vs_baseline for relative-gate categories."""
+    if not categories:
+        return {}
+    return {
+        (c.market_id, c.category): float(c.min_skill_vs_baseline)
+        for c in categories
+        if c.min_skill_vs_baseline is not None
     }
 
 
@@ -149,10 +162,17 @@ def select_champions(
         valid["abs_bias"] = 0.0
 
     gate_wmape_by_cat = _gate_wmape_by_category(categories)
-    if gate_wmape_by_cat and "category" in valid.columns and "market_id" in valid.columns:
-        gate_ceiling = pd.Series(
-            list(zip(valid["market_id"], valid["category"])), index=valid.index
-        ).map(gate_wmape_by_cat)
+    skill_by_cat = _min_skill_by_category(categories)
+    if (gate_wmape_by_cat or skill_by_cat) and "category" in valid.columns and "market_id" in valid.columns:
+        cat_keys = pd.Series(list(zip(valid["market_id"], valid["category"])), index=valid.index)
+        gate_ceiling = cat_keys.map(gate_wmape_by_cat).astype(float)
+        if skill_by_cat and "baseline_wmape_7d" in valid.columns:
+            # Relative-gate categories: ceiling = the series' own baseline * (1 - min_skill),
+            # same as training/evaluation.py::gate_wmape_ceiling.
+            min_skill = cat_keys.map(skill_by_cat).astype(float)
+            baseline = valid["baseline_wmape_7d"].astype(float)
+            use_rel = min_skill.notna() & (baseline > 0)
+            gate_ceiling = gate_ceiling.where(~use_rel, baseline * (1.0 - min_skill))
         # NaN ceiling (no threshold configured for this category) => never blocks
         # selection, same NULL-safety as bias_fail above.
         valid["gate_fail"] = (valid["wmape_7d"] > (gate_ceiling + gate_tolerance)).fillna(False)
@@ -205,12 +225,28 @@ def select_champions_spark(
     candidate_metrics_df.createOrReplaceTempView("_candidate_metrics")
 
     gate_wmape_by_cat = _gate_wmape_by_category(categories)
-    if gate_wmape_by_cat:
-        gate_rows = [(m, c, float(w)) for (m, c), w in gate_wmape_by_cat.items()]
-        gate_df = spark.createDataFrame(gate_rows, schema="market_id string, category string, gate_wmape double")
+    skill_by_cat = _min_skill_by_category(categories)
+    if gate_wmape_by_cat or skill_by_cat:
+        gate_rows = [
+            (m, c, gate_wmape_by_cat.get((m, c)), skill_by_cat.get((m, c)))
+            for (m, c) in sorted(set(gate_wmape_by_cat) | set(skill_by_cat))
+        ]
+        gate_df = spark.createDataFrame(
+            gate_rows, schema="market_id string, category string, gate_wmape double, min_skill double",
+        )
         tagged_df = (
             candidate_metrics_df.join(_F.broadcast(gate_df), on=["market_id", "category"], how="left")
         )
+        if "baseline_wmape_7d" in candidate_metrics_df.columns:
+            # Relative-gate categories: per-series ceiling, as in select_champions.
+            tagged_df = tagged_df.withColumn(
+                "gate_wmape",
+                _F.when(
+                    _F.col("min_skill").isNotNull() & (_F.col("baseline_wmape_7d") > 0),
+                    _F.col("baseline_wmape_7d") * (_F.lit(1.0) - _F.col("min_skill")),
+                ).otherwise(_F.col("gate_wmape")),
+            )
+        tagged_df = tagged_df.drop("min_skill")
     else:
         tagged_df = candidate_metrics_df.withColumn("gate_wmape", _F.lit(None).cast("double"))
     # Ensure shape-gate columns exist (gracefully disabled when not computed upstream)
@@ -284,13 +320,21 @@ def write_champion_index(spark: "SparkSession", champions_df: "DataFrame", catal
     champions_df.createOrReplaceTempView("_champions_to_write")
     safe_snapshot_date = snapshot_date.replace("'", "''")
 
-    # Determine next version: MAX(existing version) + 1 for this snapshot_date
-    existing_max = spark.sql(f"""
-        SELECT market_id, category, series_key, MAX(version) AS max_version
-        FROM {catalog}.{_SCHEMA}.{_TABLE}
-        WHERE snapshot_date = DATE('{safe_snapshot_date}')
-        GROUP BY market_id, category, series_key
-    """)
+    # Determine next version: MAX(existing version) + 1 for this snapshot_date.
+    # On the very first training run for a fresh deploy, champion_index doesn't
+    # exist yet (no DDL for it in this repo — see merge_upsert's bootstrap note);
+    # every series then starts at version 1, same as an empty existing_max.
+    if spark.catalog.tableExists(f"{catalog}.{_SCHEMA}.{_TABLE}"):
+        existing_max = spark.sql(f"""
+            SELECT market_id, category, series_key, MAX(version) AS max_version
+            FROM {catalog}.{_SCHEMA}.{_TABLE}
+            WHERE snapshot_date = DATE('{safe_snapshot_date}')
+            GROUP BY market_id, category, series_key
+        """)
+    else:
+        existing_max = spark.createDataFrame(
+            [], schema="market_id string, category string, series_key string, max_version int"
+        )
     existing_max.createOrReplaceTempView("_existing_versions")
 
     # champion_params: lightweight JSON of HPT-tuned hyperparameters (for
@@ -300,6 +344,9 @@ def write_champion_index(spark: "SparkSession", champions_df: "DataFrame", catal
     # extracted separately so it's typically just hyperparams).
     _has_hpt_params = "hpt_params" in [f.name for f in champions_df.schema.fields]
     _champion_params_expr = "c.hpt_params" if _has_hpt_params else "c.params"
+    # Older candidate rows (pre relative-gate engines) carry no baseline column.
+    _has_baseline = "baseline_wmape_7d" in [f.name for f in champions_df.schema.fields]
+    _baseline_expr = "c.baseline_wmape_7d" if _has_baseline else "CAST(NULL AS DOUBLE)"
 
     stamped_df = spark.sql(f"""
         SELECT DATE('{safe_snapshot_date}') AS snapshot_date, c.market_id, c.category, c.series_key,
@@ -311,6 +358,7 @@ def write_champion_index(spark: "SparkSession", champions_df: "DataFrame", catal
                c.wmape_7d,
                c.bias_pct,
                c.naive_mae_7d,
+               {_baseline_expr} AS baseline_wmape_7d,
                c.volume,
                c.passed_decomposition AS passed_gate,
                COALESCE(e.max_version, 0) + 1 AS version,

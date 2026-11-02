@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 
 from config.loader import CategoryConfig
-from training.evaluation import gate, wmape
+from training.evaluation import gate, gate_wmape_ceiling, wmape
 
 
 class TestWmape:
@@ -147,6 +147,81 @@ class TestGate:
         gated = gate(empty, categories)
         assert gated.empty
         assert list(gated.columns) == [
-            "market_id", "category", "grain", "entity_key", "horizon", "wmape", "volume", "threshold", "passed",
-            "bias_pct", "mase_7d",
+            "market_id", "category", "grain", "entity_key", "horizon", "wmape", "volume", "threshold",
+            "baseline_wmape", "skill", "min_skill", "passed", "bias_pct", "mase_7d",
         ]
+
+
+def _skill_categories(min_skill: float) -> list[CategoryConfig]:
+    return [
+        CategoryConfig(
+            market_id="US", category="A", accuracy_threshold=0.85, gate_grains=[],
+            series_grain="market_store_sku", drift_tolerance=0.05, min_skill_vs_baseline=min_skill,
+        ),
+    ]
+
+
+class TestSkillGate:
+    """Relative gate: pass iff 1 - wmape / baseline_wmape >= min_skill_vs_baseline."""
+
+    @pytest.fixture
+    def champions_with_baseline(self, champions_pdf) -> pd.DataFrame:
+        # Model WMAPEs 0.10 / 0.20 / 0.05 vs baselines 0.20 / 0.21 / 0.10:
+        # per-series skill 50% / ~4.8% / 50%.
+        return champions_pdf.assign(baseline_wmape_7d=[0.20, 0.21, 0.10])
+
+    def test_series_skill_and_pass_fail(self, champions_with_baseline):
+        gated = gate(champions_with_baseline, _skill_categories(0.10))
+        finest = gated[gated["grain"] == "market_store_sku"].set_index("entity_key")
+        assert finest.loc["US|A|S1|ITEM1", "skill"] == pytest.approx(0.5)
+        assert finest.loc["US|A|S2|ITEM1", "skill"] == pytest.approx(1 - 0.20 / 0.21)
+        assert bool(finest.loc["US|A|S1|ITEM1", "passed"]) is True
+        assert bool(finest.loc["US|A|S2|ITEM1", "passed"]) is False
+
+    def test_relative_gate_overrides_absolute_threshold(self):
+        """30% WMAPE fails the absolute 85% target (70% accuracy) but beats a 40%-WMAPE
+        baseline by 25% — in skill mode the relative result decides."""
+        row = _champion_row("US|A|S1|ITEM1", "US", "A", "ITEM1", wmape_7d=0.30, volume=50.0)
+        pdf = pd.DataFrame([{**row, "baseline_wmape_7d": 0.40}])
+        assert bool(gate(pdf, _skill_categories(0.10)).iloc[0]["passed"]) is True
+        assert bool(gate(pdf, _skill_categories(0.30)).iloc[0]["passed"]) is False
+        absolute = [CategoryConfig(
+            market_id="US", category="A", accuracy_threshold=0.85, gate_grains=[],
+            series_grain="market_store_sku", drift_tolerance=0.05,
+        )]
+        assert bool(gate(pdf, absolute).iloc[0]["passed"]) is False
+
+    def test_cohort_skill_is_volume_weighted(self, champions_with_baseline):
+        gated = gate(champions_with_baseline, _skill_categories(0.0))
+        cohort = gated[gated["grain"] == "category_cohort"].iloc[0]
+        model_w = (0.10 * 100 + 0.20 * 300 + 0.05 * 200) / 600
+        base_w = (0.20 * 100 + 0.21 * 300 + 0.10 * 200) / 600
+        assert cohort["baseline_wmape"] == pytest.approx(base_w)
+        assert cohort["skill"] == pytest.approx(1 - model_w / base_w)
+        assert cohort["min_skill"] == 0.0
+
+    def test_falls_back_to_absolute_gate_without_baseline(self, champions_pdf):
+        gated = gate(champions_pdf, _skill_categories(0.10))
+        finest = gated[gated["grain"] == "market_store_sku"].set_index("entity_key")
+        # no baseline column -> absolute 85% target: 0.10 passes (90%), 0.20 fails (80%)
+        assert bool(finest.loc["US|A|S1|ITEM1", "passed"]) is True
+        assert bool(finest.loc["US|A|S2|ITEM1", "passed"]) is False
+
+    def test_zero_last_fold_volume_series_still_gets_skill(self):
+        row = _champion_row("US|A|S1|ITEM1", "US", "A", "ITEM1", wmape_7d=0.30, volume=0.0)
+        gated = gate(pd.DataFrame([{**row, "baseline_wmape_7d": 0.40}]), _skill_categories(0.10))
+        finest = gated[gated["grain"] == "market_store_sku"].iloc[0]
+        assert finest["skill"] == pytest.approx(0.25)
+        assert bool(finest["passed"]) is True
+
+
+class TestGateWmapeCeiling:
+    def test_relative_ceiling_uses_series_baseline(self):
+        assert gate_wmape_ceiling(_skill_categories(0.10)[0], 0.40) == pytest.approx(0.36)
+
+    def test_absolute_ceiling_when_no_baseline(self):
+        assert gate_wmape_ceiling(_skill_categories(0.10)[0], float("nan")) == pytest.approx(0.15)
+
+    def test_none_without_category(self):
+        assert gate_wmape_ceiling(None, 0.4) is None
+
